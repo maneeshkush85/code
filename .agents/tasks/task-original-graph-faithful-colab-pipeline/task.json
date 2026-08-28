@@ -1,0 +1,35 @@
+{
+  "task_id": "task-original-graph-faithful-colab-pipeline",
+  "task_description": "Create a single self-contained Google Colab Python script (LTX23_Director_OriginalGraph_Colab.py) that faithfully re-executes the ORIGINAL ComfyUI graph LTX-2.3_Director_2.0-MV-Workflow-30s.json by loading the JSON as source of truth, parsing it into an internal graph, and topologically executing the REAL registered ComfyUI node classes via a memory-aware execute_node() layer, with LTXDirector (node 131) remaining the master timeline controller. Memory-management infrastructure is lifted from LTX23_Director_Master_V2.py; the FORBIDDEN 5-segment architecture from V2/V3 must NOT be reproduced. Because the sandbox has no GPU/ComfyUI/models, only the pure-Python parser + graph validator + self-audit (runnable via --validate-only) are provable here; GPU execution requires a real Colab T4 run.",
+  "status": "completed",
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003"],
+  "blocked_reason": null,
+  "review": {
+    "iterations": 1,
+    "final_verdict": "APPROVED",
+    "v1_review": "2026-08-28-113554-review.md (NEEDS_CHANGES, 6 issues)",
+    "v2_review": "2026-08-28-114529-review.md (APPROVED; 2 non-blocking residual notes)",
+    "residual_non_blocking": [
+      "LTXDirector 131 _custom_node_kwargs seeds a name-guarded speculative timeline-scalar candidates dict (frame_rate/fps/duration/frames/length); safe (cannot clobber a linked input or invent an undeclared arg) but likely unnecessary since the node reads scalars from its serialized timeline. Only verifiable on real Colab.",
+      "rgthree 138 LoRA fallback resolves model/clip by slot index (resolved_inputs.get(0)/.get(1)) rather than by name; correct for node 138 as wired but inconsistent with the by-name discipline used on the primary path."
+    ]
+  },
+  "verification": {
+    "build": "pass",
+    "tests": "pass",
+    "test_quality": "pass",
+    "docker_build": "skipped",
+    "summary": "python3 -m py_compile clean; python3 LTX23_Director_OriginalGraph_Colab.py --validate-only exits 0 with Section-27 report all 9 PASS, Section-41 self-audit 52/52 checked, and Section-40 honesty block. The validator/audit derive their pass state from the parsed real JSON (tampering a value flips the item), so the stdlib smoke test is a meaningful check of the parser+validator against the source of truth. No Dockerfile in repo, and GPU execution (model download, ComfyUI node run, MP4 render) cannot be verified in this CPU-only sandbox - documented honestly in the Section-40 block. Known cosmetic note: the audit's 'Stage 1/Stage 2' human labels follow the user's prose convention, which is inverted vs the JSON topology (base stage uses guide 0.5+8steps, upscale stage uses guide 1.0+4steps); underlying node-id->value mappings are all faithful to the JSON."
+  },
+  "review_iteration_1_fixes": {
+    "review_file": "2026-08-28-113554-review.md",
+    "verdict_addressed": "NEEDS_CHANGES (6 issues)",
+    "issue_1_generic_widget_arg_mapping": "FIXED. Added GraphExecutor._custom_node_kwargs with EXPLICIT per-node argument construction for LTXDirector 131, Power Lora Loader (rgthree) 138, and VHS_VideoCombine 139 instead of positional widget fill. 131 passes only linked inputs + timeline scalars matched to live INPUT_TYPES arg names by name; 138 passes only linked model/clip (dynamic rgthree dicts never fed positionally, documented LoraLoader fallback remains); 139 passes dict widget values by name intersection. Chose bespoke-executor path (not full ComfyUI PromptExecutor) to stay consistent with existing architecture, and documented residual risk in-code + Section-40.",
+    "issue_2_slot_vs_name_mapping": "FIXED. Added GraphExecutor._linked_kwargs_by_name; link inputs now map via node['inputs'][to_slot]['name'] to matching INPUT_TYPES key, never by slot position.",
+    "issue_3_stage_label_inversion": "FIXED (cosmetic). Added explicit topology comments at both stage blocks tying label -> node ids + guide strength (base = node 133 @ 0.5 + scheduler 33 8steps/1.0; upscale = node 132 @ 1.0 + scheduler 21 4steps/0.42). No node-id->value binding changed.",
+    "issue_4_unlinked_optional_sockets": "FIXED. _linked_kwargs_by_name only fills linked slots, and _custom_node_kwargs explicitly pops optional_latent/global_prompt for node 131 so the node uses its own defaults.",
+    "issue_5_checkpoint_resume": "FIXED (documented limitation). Wired _try_restore into ensure_node_executed; it only short-circuits when a live in-process output exists, and RE-EXECUTES across a restart because tensor outputs are non-serializable. Narrowed CheckpointManager + _try_restore docstrings to say it is a progress log, not cached compute.",
+    "issue_6_honesty_block": "FIXED. Section-40 honesty block now lists the custom-node arg-mapping faithfulness risk and the checkpoint-resume re-execution limitation.",
+    "verification": "python3 -m py_compile clean; --validate-only exits 0, Section-27 all 9 PASS, Section-41 52/52, Section-40 honesty block (now including the two new risk lines). Python 3.9 syntax preserved; no new GPU/torch imports at module scope."
+  }
+}
