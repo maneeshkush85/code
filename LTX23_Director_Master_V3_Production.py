@@ -38,6 +38,10 @@ from typing import Sequence, Mapping, Any, Union, Dict, List, Optional, Tuple
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,garbage_collection_threshold:0.8'
 os.environ['TORCH_CUDNN_V8_API_ENABLED'] = '1'
 os.environ['MALLOC_TRIM_THRESHOLD_'] = '65536'
+# Cap glibc malloc arenas: the pipeline repeatedly allocates/frees multi-GB
+# buffers (GGUF reloads, VAE decodes). Without this, glibc spawns many per-thread
+# arenas and host RAM balloons via fragmentation on a 12.2 GB Colab box.
+os.environ['MALLOC_ARENA_MAX'] = '2'
 
 def run_cmd(cmd: str, silent: bool = True) -> int:
     if silent:
@@ -51,7 +55,7 @@ if not os.path.exists("/content/swapfile") or os.path.getsize("/content/swapfile
     print("⚙️ [1/3] Setting up Contiguous 16GB Swap Partition...")
     run_cmd("swapoff /content/swapfile || true")
     run_cmd("rm -f /content/swapfile")
-    run_cmd("dd if=/dev/zero of=/content/swapfile bs=1M count=16384 status=none || fallocate -l 16G /content/swapfile")
+    run_cmd("fallocate -l 16G /content/swapfile || dd if=/dev/zero of=/content/swapfile bs=1M count=16384 status=none")
     run_cmd("chmod 600 /content/swapfile")
     run_cmd("mkswap /content/swapfile")
     run_cmd("swapon /content/swapfile || true")
@@ -63,6 +67,10 @@ try:
     sw = psutil.swap_memory()
     vm = psutil.virtual_memory()
     print(f"  📊 Memory Status: Host RAM: {vm.available/1e9:.2f} GB available ({vm.total/1e9:.2f} GB total) | Swap: {sw.total/1e9:.2f} GB")
+    if sw.total < (1 * 1024 * 1024 * 1024):
+        print("  ⚠️  WARNING: swap is NOT active (Colab usually blocks `swapon`). The host-RAM")
+        print("     safety buffer is gone, so an oversized DiT quant WILL hard-crash the session.")
+        print("     Keep DIT_QUANT at Q3_K_S/Q3_K_M so the model fits VRAM without offloading to RAM.")
 except Exception:
     pass
 
@@ -163,6 +171,107 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🎛️  MASTER SETTINGS  (Colab form) — edit everything here
+# All downstream cells read from these variables. @param annotations render as
+# form widgets in Colab; in plain Python they are ordinary assignments.
+# ════════════════════════════════════════════════════════════════════════════
+# @markdown # 🎛️ Master Settings: Model, Resolution, LoRAs, Sampling & LTXDirector Timeline
+
+# @markdown ### 🧠 DiT Model (T4 VRAM sizing — see note)
+# @markdown Q3_K_S(~9.5GB, T4-safe) · Q3_K_M(~10.5GB) · Q4_K_S(~11.8GB) · Q4_K_M(~12.5GB, needs >15GB VRAM)
+# @markdown `distilled` converges in fewer steps (faster). If you pick "distilled",
+# @markdown turn OFF use_lora_1 below (it is the distill delta already baked into that base).
+model_variant = "dev"           # @param ["dev", "distilled"]
+dit_quant = "Q3_K_S"            # @param ["Q3_K_S", "Q3_K_M", "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0"]
+# @markdown Keep the DiT fully on GPU (avoids the CPU offload that makes each step take minutes). Turn OFF only if you hit CUDA OOM.
+force_gpu_resident_dit = True   # @param {type:"boolean"}
+
+# @markdown ### ⚡ Performance (speed vs VRAM)
+# @markdown `ff_chunks`: 0 = fastest (no FFN chunking, needs most VRAM) · 8 = slowest/safest. Try 0 or 2 once the model fits.
+ff_chunks = 4                   # @param [0, 1, 2, 4, 8] {type:"raw"}
+use_sage_attention = False      # @param {type:"boolean"}
+# @markdown `enable_stage2_upscale`: OFF = decode at base res only. Skips the heavy,
+# @markdown OOM-prone 2x refinement -> ~2-3x FASTER and far less VRAM (lower final res).
+enable_stage2_upscale = True    # @param {type:"boolean"}
+# @markdown Auto-recover from CUDA OOM by clearing VRAM and retrying with CPU offload.
+auto_vram_oom_fallback = True   # @param {type:"boolean"}
+
+# @markdown ### 🖥️ Resolution & Output
+custom_width = 1280            # @param [768, 832, 960, 1024, 1152, 1280] {type:"raw"}
+custom_height = 720            # @param [432, 480, 544, 576, 640, 720] {type:"raw"}
+divisible_by = 32             # @param [8, 16, 32, 64] {type:"raw"}
+resize_method = "maintain aspect ratio"  # @param ["maintain aspect ratio", "stretch", "crop", "pad"]
+img_compression = 18          # @param {type:"slider", min:0, max:100, step:1}
+fps = 24                      # @param [24, 25, 30] {type:"raw"}
+output_crf = 8                # @param {type:"slider", min:0, max:30, step:1}
+
+# @markdown ### 🎲 Runtime
+base_seed = 2026              # @param {type:"integer"}
+seed_mode = "fixed"           # @param ["fixed", "random"]
+resume_checkpoints = True     # @param {type:"boolean"}
+debug_mode = False            # @param {type:"boolean"}
+debug_max_frames = 120        # @param {type:"slider", min:24, max:756, step:8}
+min_ram_guard_gb = 2.5        # @param {type:"slider", min:1.0, max:6.0, step:0.5}
+
+# @markdown ### 🎛️ Director 2.0 — 4-LoRA Stack
+use_lora_1 = True             # @param {type:"boolean"}
+lora_strength_1 = 0.4         # @param {type:"slider", min:0.0, max:1.5, step:0.05}
+use_lora_2 = True             # @param {type:"boolean"}
+lora_strength_2 = 0.6         # @param {type:"slider", min:0.0, max:1.5, step:0.05}
+use_lora_3 = True             # @param {type:"boolean"}
+lora_strength_3 = 0.7         # @param {type:"slider", min:0.0, max:1.5, step:0.05}
+use_lora_4 = True             # @param {type:"boolean"}
+lora_strength_4 = 0.9         # @param {type:"slider", min:0.0, max:1.5, step:0.05}
+lora_name_1 = "ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors"  # @param {type:"string"}
+lora_name_2 = "LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors"                                # @param {type:"string"}
+lora_name_3 = "ltx2.3-transition.safetensors"                                           # @param {type:"string"}
+lora_name_4 = "LTX2.3-MVCamera-drclips.safetensors"                                     # @param {type:"string"}
+
+# @markdown ### ⚙️ Two-Stage Sampling
+sampler_name = "euler"          # @param ["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_sde", "ddim", "lcm"]
+scheduler_name = "linear_quadratic"  # @param ["linear_quadratic", "normal", "karras", "simple", "sgm_uniform", "beta"]
+sampler_cfg = 1.0               # @param {type:"slider", min:1.0, max:8.0, step:0.1}
+stage1_steps = 8                # @param {type:"slider", min:2, max:30, step:1}
+stage1_denoise = 1.0            # @param {type:"slider", min:0.1, max:1.0, step:0.01}
+stage1_guide_strength = 0.5     # @param {type:"slider", min:0.0, max:1.0, step:0.05}
+stage2_steps = 4                # @param {type:"slider", min:1, max:20, step:1}
+stage2_denoise = 0.42           # @param {type:"slider", min:0.05, max:1.0, step:0.01}
+stage2_guide_strength = 1.0     # @param {type:"slider", min:0.0, max:1.0, step:0.05}
+guide_frame = 1                 # @param {type:"integer"}
+guide_interpolation = "bicubic" # @param ["bicubic", "bilinear", "nearest", "area"]
+guide_crop_position = "center"  # @param ["center", "top", "bottom", "left", "right"]
+
+# @markdown ### 🎬 LTXDirector Timeline
+duration_seconds = 31.5         # @param {type:"number"}
+total_frames = 756              # @param {type:"integer"}
+timeline_start_frame = 0        # @param {type:"integer"}
+timeline_epsilon = 0.001        # @param {type:"number"}
+main_track_enabled = True       # @param {type:"boolean"}
+audio_track_enabled = True      # @param {type:"boolean"}
+motion_track_enabled = True     # @param {type:"boolean"}
+# @markdown Comma-separated per-segment values (5 segments):
+segment_lengths = "226.01059340956584,161.31859976617454,131.45629831196658,225.5063328766255,83.22765271847516"  # @param {type:"string"}
+guide_strength = "1.00,1.00,1.00,1.00,1.00"  # @param {type:"string"}
+# @markdown Per-segment keyframe images (relative to ComfyUI/input):
+seg1_image = "whatdreamscost/1.png"    # @param {type:"string"}
+seg2_image = "whatdreamscost/2.png"    # @param {type:"string"}
+seg3_image = "whatdreamscost/3.png"    # @param {type:"string"}
+seg4_image = "whatdreamscost/4.png"    # @param {type:"string"}
+seg5_image = "whatdreamscost/5.3.png"  # @param {type:"string"}
+
+# @markdown ### 🎵 Audio Track
+audio_file = "whatdreamscost/Late night trap.mp3"  # @param {type:"string"}
+audio_trim_start_frames = 446.9222739141953        # @param {type:"number"}
+audio_duration_frames = 2880                        # @param {type:"integer"}
+inpaint_audio = True            # @param {type:"boolean"}
+override_audio = False          # @param {type:"boolean"}
+use_custom_audio = True         # @param {type:"boolean"}
+use_custom_motion = True        # @param {type:"boolean"}
+
+print(f"🎛️ Master Settings loaded (quant={dit_quant} | {custom_width}x{custom_height} @ {fps}fps | {total_frames} frames).")
+
 def download_file(url: str, dest_dir: str, filename: Optional[str] = None) -> Optional[str]:
     try:
         Path(dest_dir).mkdir(parents=True, exist_ok=True)
@@ -197,14 +306,32 @@ def link_file_safe(src_path: str, dst_path: str):
         except Exception:
             pass
 
-print("📦 Downloading LTX-2.3 Core Models...")
+# ─── T4 FREE-TIER DiT SIZING (root cause of the mid-sampling "session crashed") ─
+# The 22B DiT must fit in VRAM *with* room for the video activation pool. If it
+# does not, ComfyUI pages weights to host RAM to make sampling fit, and the
+# 12.2 GB Colab box gets OOM-killed mid-sampling (silent crash, no CUDA error).
+# Approx dev-quant sizes on a 15 GB T4 (weights | activation headroom left):
+#   Q4_K_M ≈ 12.5 GB | ~3 GB  -> forces CPU offload -> HOST-RAM OOM
+#   Q4_K_S ≈ 11.8 GB | ~4 GB  -> still risky
+#   Q3_K_M ≈ 10.5 GB | ~5 GB  -> borderline OK
+#   Q3_K_S ≈  9.5 GB | ~6 GB  -> RECOMMENDED for T4 free tier
+# Set via the `dit_quant` / `force_gpu_resident_dit` fields in Master Settings.
+DIT_QUANT = os.environ.get("LTX_DIT_QUANT", dit_quant)
+DIT_VARIANT = os.environ.get("LTX_DIT_VARIANT", model_variant)  # "dev" or "distilled"
+DIT_GGUF_FILENAME = f"ltx-2-3-22b-{DIT_VARIANT}-{DIT_QUANT}.gguf"
+DIT_GGUF_URL = f"https://huggingface.co/vantagewithai/LTX-2.3-GGUF/resolve/main/{DIT_VARIANT}/{DIT_GGUF_FILENAME}"
+FORCE_GPU_RESIDENT_DIT = force_gpu_resident_dit or (os.environ.get("LTX_FORCE_GPU_RESIDENT", "0") == "1")
+FF_CHUNKS = int(ff_chunks)
+USE_SAGE_ATTENTION = bool(use_sage_attention)
+
+print(f"📦 Downloading LTX-2.3 Core Models... (DiT: {DIT_VARIANT} {DIT_QUANT})")
 
 dit_model = download_file(
-    "https://huggingface.co/vantagewithai/LTX-2.3-GGUF/resolve/main/dev/ltx-2-3-22b-dev-Q4_K_M.gguf",
+    DIT_GGUF_URL,
     "/content/ComfyUI/models/unet",
-    filename="ltx-2-3-22b-dev-Q4_K_M.gguf"
+    filename=DIT_GGUF_FILENAME
 )
-link_file_safe("/content/ComfyUI/models/unet/ltx-2-3-22b-dev-Q4_K_M.gguf", "/content/ComfyUI/models/diffusion_models/ltx-2-3-22b-dev-Q4_K_M.gguf")
+link_file_safe(f"/content/ComfyUI/models/unet/{DIT_GGUF_FILENAME}", f"/content/ComfyUI/models/diffusion_models/{DIT_GGUF_FILENAME}")
 
 text_encoder_model = download_file(
     "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors",
@@ -384,76 +511,64 @@ Positive Prompt, in my hub."
 
 NEGATIVE_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走, robotic movement, static presenter, jitter, flicker, facial distortion, extra limbs, watermark"
 
+# ─── Build the timeline + segments from the Master Settings above ────────────
+_seg_lengths = [float(x) for x in str(segment_lengths).split(",") if str(x).strip() != ""]
+_seg_images = [seg1_image, seg2_image, seg3_image, seg4_image, seg5_image][:len(_seg_lengths)]
+_seg_ids = [
+    "1785555235678s2fn3", "17855552413529uw9r", "1785555243885y3h85",
+    "1785555247117rcoma", "17855554543736wlrg",
+]
+# Derive a base stage-1 (pre-upscale) resolution from the target, rounded to divisible_by.
+def _round_to(v, m):
+    return max(int(m), int(round(v / m)) * int(m))
+_gen_w = _round_to(custom_width * 0.65, divisible_by)   # ~832 from 1280
+_gen_h = _round_to(custom_height * 0.667, divisible_by)  # ~480 from 720
+
 TIMELINE_METADATA = {
-    "frame_rate": 24.0,
-    "duration_seconds": 31.5,
-    "normalDurationFrames": 756,
-    "start_frame": 0,
-    "end_frame": 756,
-    "custom_width": 1280,
-    "custom_height": 720,
-    "generation_width": 832,
-    "generation_height": 480,
-    "base_stage1_width": 416,
-    "base_stage1_height": 240,
-    "mainTrackEnabled": True,
-    "audioTrackEnabled": True,
-    "motionTrackEnabled": True,
-    "inpaint_audio": True,
-    "override_audio": False,
-    "use_custom_audio": True,
-    "use_custom_motion": True,
-    "audio_file": "whatdreamscost/Late night trap.mp3",
-    "audio_duration_frames": 2880,
-    "audio_trim_start_frames": 446.9222739141953,
-    "guide_strength": "1.00,1.00,1.00,1.00,1.00",
-    "segment_lengths": "226.01059340956584,161.31859976617454,131.45629831196658,225.5063328766255,83.22765271847516"
+    "frame_rate": float(fps),
+    "duration_seconds": float(duration_seconds),
+    "normalDurationFrames": int(total_frames),
+    "start_frame": int(timeline_start_frame),
+    "end_frame": int(total_frames),
+    "custom_width": int(custom_width),
+    "custom_height": int(custom_height),
+    "generation_width": _gen_w,
+    "generation_height": _gen_h,
+    "base_stage1_width": _round_to(_gen_w / 2, divisible_by),
+    "base_stage1_height": _round_to(_gen_h / 2, divisible_by),
+    "divisible_by": int(divisible_by),
+    "resize_method": resize_method,
+    "img_compression": int(img_compression),
+    "mainTrackEnabled": bool(main_track_enabled),
+    "audioTrackEnabled": bool(audio_track_enabled),
+    "motionTrackEnabled": bool(motion_track_enabled),
+    "inpaint_audio": bool(inpaint_audio),
+    "override_audio": bool(override_audio),
+    "use_custom_audio": bool(use_custom_audio),
+    "use_custom_motion": bool(use_custom_motion),
+    "audio_file": audio_file,
+    "audio_duration_frames": int(audio_duration_frames),
+    "audio_trim_start_frames": float(audio_trim_start_frames),
+    "guide_strength": str(guide_strength),
+    "segment_lengths": str(segment_lengths),
+    "epsilon": float(timeline_epsilon),
 }
 
-ORIGINAL_SEGMENTS = [
-    {
-        "id": "1785555235678s2fn3",
-        "start": 0.0,
-        "length": 226.01059340956584,
+ORIGINAL_SEGMENTS = []
+_cum = 0.0
+for _i, _len in enumerate(_seg_lengths):
+    ORIGINAL_SEGMENTS.append({
+        "id": _seg_ids[_i] if _i < len(_seg_ids) else f"seg_{_i+1}",
+        "start": _cum,
+        "length": float(_len),
         "prompt": "",
         "type": "image",
-        "imageFile": "whatdreamscost/1.png"
-    },
-    {
-        "id": "17855552413529uw9r",
-        "start": 226.01059340956584,
-        "length": 161.31859976617454,
-        "prompt": "",
-        "type": "image",
-        "imageFile": "whatdreamscost/2.png"
-    },
-    {
-        "id": "1785555243885y3h85",
-        "start": 387.3291931757404,
-        "length": 131.45629831196658,
-        "prompt": "",
-        "type": "image",
-        "imageFile": "whatdreamscost/3.png"
-    },
-    {
-        "id": "1785555247117rcoma",
-        "start": 518.785491487707,
-        "length": 225.5063328766255,
-        "prompt": "",
-        "type": "image",
-        "imageFile": "whatdreamscost/4.png"
-    },
-    {
-        "id": "17855554543736wlrg",
-        "start": 744.2918243643325,
-        "length": 83.22765271847516,
-        "prompt": "",
-        "type": "image",
-        "imageFile": "whatdreamscost/5.3.png"
-    }
-]
+        "imageFile": _seg_images[_i] if _i < len(_seg_images) else f"whatdreamscost/{_i+1}.png",
+    })
+    _cum += float(_len)
 
-print("✅ Cell 6: Authoritative Timeline & Global Prompt loaded.")
+print(f"✅ Cell 6: Timeline built from settings ({len(ORIGINAL_SEGMENTS)} segments | "
+      f"gen {_gen_w}x{_gen_h} -> {custom_width}x{custom_height}).")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -626,7 +741,114 @@ class LTXDirectorMemoryManager:
         LTXDirectorMemoryManager.drop_os_page_cache()
         malloc_trim_os()
 
-print("✅ Cell 8: Fast GPU Memory Engine Active.")
+
+def soft_gpu_clear():
+    """Lightweight GPU-VRAM clear WITHOUT unloading models (fast, call between steps)."""
+    try:
+        import comfy.model_management as mm
+        mm.soft_empty_cache()
+    except Exception:
+        pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+def set_vram_mode(high: bool) -> bool:
+    """Switch ComfyUI between keep-on-GPU (HIGH) and allow-CPU-offload (NORMAL)."""
+    try:
+        import comfy.model_management as mm
+        if hasattr(mm, "VRAMState") and hasattr(mm, "vram_state"):
+            mm.vram_state = mm.VRAMState.HIGH_VRAM if high else mm.VRAMState.NORMAL_VRAM
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def run_sampler_with_fallback(sampler_custom_node, stage_tag: str = "", **sampler_kwargs):
+    """
+    Run SamplerCustomAdvanced with automatic CUDA-OOM recovery.
+    On OOM: clear VRAM, allow ComfyUI to offload layers to CPU (NORMAL_VRAM), and
+    retry once. This lets the heavy 2x Stage-2 pass complete on a 15 GB T4 instead
+    of hard-crashing (it runs slower while offloading, but it finishes).
+    """
+    try:
+        return call_original_node("SamplerCustomAdvanced", node_instance=sampler_custom_node, **sampler_kwargs)
+    except Exception as e:
+        msg = str(e).lower()
+        is_oom = ("out of memory" in msg) or ("outofmemory" in msg) or ("cuda error" in msg)
+        if auto_vram_oom_fallback and is_oom:
+            print(f"  ⚠️ CUDA OOM during {stage_tag} sampling -> clearing VRAM and retrying with CPU offload...")
+            soft_gpu_clear()
+            set_vram_mode(False)  # allow partial offload so the activation pool fits
+            soft_gpu_clear()
+            return call_original_node("SamplerCustomAdvanced", node_instance=sampler_custom_node, **sampler_kwargs)
+        raise
+
+
+def ram_guard(min_free_gb: float = 2.0, tag: str = ""):
+    """Proactively deep-purge when host RAM runs low (ported from V2)."""
+    try:
+        import psutil
+        free = psutil.virtual_memory().available / 1e9
+    except Exception:
+        return
+    if free < min_free_gb:
+        print(f"⚠️ [RAM GUARD] Free RAM ({free:.2f} GB) < {min_free_gb} GB -> deep purge ({tag})")
+        LTXDirectorMemoryManager.purge(f"ram_guard:{tag}")
+
+
+def patch_comfy_memory_safety():
+    """Make ComfyUI's free_memory tolerant of None returns (ported from V2)."""
+    try:
+        import comfy.model_management as mm
+        if not getattr(mm, "_ltx_free_memory_safe", False):
+            _orig_free_memory = mm.free_memory
+            def _safe_free_memory(*args, **kwargs):
+                try:
+                    res = _orig_free_memory(*args, **kwargs)
+                    return res if isinstance(res, list) else []
+                except Exception:
+                    return []
+            mm.free_memory = _safe_free_memory
+            mm._ltx_free_memory_safe = True
+    except Exception as e:
+        print(f"  [Notice] memory-safety patch skipped: {e}")
+
+
+def patch_safetensors_direct_to_gpu():
+    """
+    Load text-encoder weights (Gemma/CLIP/projection) straight to CUDA to avoid a
+    multi-GB host-RAM copy during Phase A (ported from V2). Falls back to CPU on
+    any error so it can never break loading.
+    """
+    try:
+        import safetensors.torch as st
+        if not getattr(st, "_ltx_cuda_direct", False):
+            _orig_load = st.load_file
+            def _cuda_direct_load(filename, device="cpu"):
+                fn = str(filename).lower()
+                if torch.cuda.is_available() and any(
+                    k in fn for k in ["gemma", "clip", "text_encoder", "projection", "connector"]
+                ):
+                    try:
+                        return _orig_load(filename, device="cuda")
+                    except Exception:
+                        return _orig_load(filename, device=device)
+                return _orig_load(filename, device=device)
+            st.load_file = _cuda_direct_load
+            st._ltx_cuda_direct = True
+    except Exception:
+        pass
+
+
+# Apply the memory patches now so they cover Phase A text encoding.
+patch_comfy_memory_safety()
+patch_safetensors_direct_to_gpu()
+
+print("✅ Cell 8: Fast GPU Memory Engine Active (+ V2 RAM guard, safetensors→GPU, free_memory guard).")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -734,14 +956,14 @@ class DirectorTimelineController:
             "display_mode": "seconds",
             "custom_width": int(self.meta["custom_width"]),
             "custom_height": int(self.meta["custom_height"]),
-            "resize_method": "maintain aspect ratio",
-            "divisible_by": 32,
-            "img_compression": 18,
+            "resize_method": self.meta.get("resize_method", "maintain aspect ratio"),
+            "divisible_by": int(self.meta.get("divisible_by", 32)),
+            "img_compression": int(self.meta.get("img_compression", 18)),
             "guide_strength": str(self.meta["guide_strength"]),
             "local_prompts": " |  |  |  | ",
             "segment_lengths": str(self.meta["segment_lengths"]),
             "timeline_data": tl_json_str,
-            "epsilon": 0.001,
+            "epsilon": float(self.meta.get("epsilon", 0.001)),
             "start_second": 0.0,
             "end_second": float(self.meta["duration_seconds"]),
             "duration_seconds": float(self.meta["duration_seconds"]),
@@ -768,18 +990,18 @@ class DirectorTimelineController:
             tl_json_str,
             " |  |  |  | ",
             str(self.meta["segment_lengths"]),
-            0.001,
+            float(self.meta.get("epsilon", 0.001)),
             str(self.meta["guide_strength"]),
-            True,
-            True,
-            True,
+            bool(self.meta["mainTrackEnabled"]),
+            bool(self.meta["audioTrackEnabled"]),
+            bool(self.meta["motionTrackEnabled"]),
             float(self.meta["frame_rate"]),
             "seconds",
             int(self.meta["custom_width"]),
             int(self.meta["custom_height"]),
-            "maintain aspect ratio",
-            32,
-            18,
+            self.meta.get("resize_method", "maintain aspect ratio"),
+            int(self.meta.get("divisible_by", 32)),
+            int(self.meta.get("img_compression", 18)),
             False,
             ""
         ]
@@ -1003,9 +1225,9 @@ def call_original_node(node_name: str, node_instance: Optional[Any] = None, **kw
             for group in ["required", "optional", "hidden"]:
                 group_dict = it.get(group, {})
                 for p_name, p_spec in group_dict.items():
-                    if isinstance(p_spec, tuple) and len(p_spec) > 1 and isinstance(p_spec, dict) and "default" in p_spec:
-                        comfy_schema_defaults[p_name] = p_spec["default"]
-                    elif isinstance(p_spec, tuple) and len(p_spec) > 0 and isinstance(p_spec[0], list) and len(p_spec[0]) > 0:
+                    if isinstance(p_spec, (tuple, list)) and len(p_spec) > 1 and isinstance(p_spec[1], dict) and "default" in p_spec[1]:
+                        comfy_schema_defaults[p_name] = p_spec[1]["default"]
+                    elif isinstance(p_spec, (tuple, list)) and len(p_spec) > 0 and isinstance(p_spec[0], list) and len(p_spec[0]) > 0:
                         comfy_schema_defaults[p_name] = p_spec[0][0]
         except Exception:
             pass
@@ -1238,68 +1460,82 @@ def load_clip_and_encode_to_gpu(prompt_text: str) -> Tuple[Any, Any]:
 
 def load_dit_and_loras():
     LTXDirectorMemoryManager.print_diagnostics(phase="DiT Loading", node="UnetLoaderGGUF")
-    model = gv(call_original_node("UnetLoaderGGUF", unet_name="ltx-2-3-22b-dev-Q4_K_M.gguf"), 0)
-    print("  ✓ UnetLoaderGGUF loaded.")
+    model = gv(call_original_node("UnetLoaderGGUF", unet_name=DIT_GGUF_FILENAME), 0)
+    print(f"  ✓ UnetLoaderGGUF loaded ({DIT_GGUF_FILENAME}).")
 
+    # Build the LoRA stack from Master Settings (toggles / strengths / names).
+    _lora_settings = [
+        (use_lora_1, lora_name_1, lora_strength_1),
+        (use_lora_2, lora_name_2, lora_strength_2),
+        (use_lora_3, lora_name_3, lora_strength_3),
+        (use_lora_4, lora_name_4, lora_strength_4),
+    ]
     power_lora_node = NODE_CLASS_MAPPINGS["Power Lora Loader (rgthree)"]()
-    lora_stack_params = {
-        "model": model,
-        "clip": None,
-        "lora_1": {
-            "on": True,
-            "lora": "ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors",
-            "strength": 0.4
-        },
-        "lora_2": {
-            "on": True,
-            "lora": "LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors",
-            "strength": 0.6
-        },
-        "lora_3": {
-            "on": True,
-            "lora": "ltx2.3-transition.safetensors",
-            "strength": 0.7
-        },
-        "lora_4": {
-            "on": True,
-            "lora": "LTX2.3-MVCamera-drclips.safetensors",
-            "strength": 0.9
-        }
-    }
+    lora_stack_params = {"model": model, "clip": None}
+    _active = 0
+    for _n, (_on, _name, _str) in enumerate(_lora_settings, start=1):
+        lora_stack_params[f"lora_{_n}"] = {"on": bool(_on), "lora": _name, "strength": float(_str)}
+        if _on:
+            _active += 1
 
     try:
         res = call_original_node("Power Lora Loader (rgthree)", node_instance=power_lora_node, **lora_stack_params)
         model = gv(res, 0) or model
-        print("  ✓ Power Lora Loader (rgthree) applied 4-LoRA stack to DiT.")
+        print(f"  ✓ Power Lora Loader (rgthree) applied {_active}-LoRA stack to DiT.")
     except Exception as e:
         print(f"  [Notice] PowerLora fallback: {e}")
         from nodes import LoraLoaderModelOnly
-        for lora_cfg in [
-            ("ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors", 0.4),
-            ("LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors", 0.6),
-            ("ltx2.3-transition.safetensors", 0.7),
-            ("LTX2.3-MVCamera-drclips.safetensors", 0.9),
-        ]:
+        for _on, _name, _str in _lora_settings:
+            if not _on:
+                continue
+            lora_cfg = (_name, float(_str))
             if os.path.exists(os.path.join("/content/ComfyUI/models/loras", lora_cfg[0])):
                 ll = LoraLoaderModelOnly()
-                model = gv(ll.load_lora_model_only(model=model, lora_name=lora_cfg[0], strength_model=lora_cfg), 0)
-                print(f"    + LoRA applied: {lora_cfg[0]} (Strength {lora_cfg})")
+                model = gv(ll.load_lora_model_only(model=model, lora_name=lora_cfg[0], strength_model=lora_cfg[1]), 0)
+                print(f"    + LoRA applied: {lora_cfg[0]} (Strength {lora_cfg[1]})")
 
-    # SageAttention & Chunk Feed Forward Hooks
-    if "PatchSageAttentionKJ" in NODE_CLASS_MAPPINGS:
+    # SageAttention & Chunk Feed Forward Hooks (both configurable for speed).
+    # NOTE: SageAttention needs Ampere+ (sm_80); it is a no-op/unsupported on the
+    # T4 (Turing sm_75), so it defaults OFF. FF chunking trades speed for VRAM —
+    # ff_chunks=0 disables it (fastest) once the quant fits in VRAM.
+    if USE_SAGE_ATTENTION and "PatchSageAttentionKJ" in NODE_CLASS_MAPPINGS:
         try:
             sage = NODE_CLASS_MAPPINGS["PatchSageAttentionKJ"]()
             model = gv(call_original_node("PatchSageAttentionKJ", node_instance=sage, model=model, sage_attention="auto"), 0) or model
             print("  ✓ SageAttention Hook Applied.")
         except Exception:
             pass
-    if "LTXVChunkFeedForward" in NODE_CLASS_MAPPINGS:
+    if FF_CHUNKS and FF_CHUNKS > 0 and "LTXVChunkFeedForward" in NODE_CLASS_MAPPINGS:
         try:
             cff = NODE_CLASS_MAPPINGS["LTXVChunkFeedForward"]()
-            model = gv(call_original_node("LTXVChunkFeedForward", node_instance=cff, model=model, chunks=8, dim_threshold=4096), 0) or model
-            print("  ✓ ChunkFeedForward Hook Applied (chunks=8).")
+            model = gv(call_original_node("LTXVChunkFeedForward", node_instance=cff, model=model, chunks=FF_CHUNKS, dim_threshold=4096), 0) or model
+            print(f"  ✓ ChunkFeedForward Hook Applied (chunks={FF_CHUNKS}).")
         except Exception:
             pass
+    else:
+        print("  ✓ ChunkFeedForward disabled (ff_chunks=0) -> faster FFN, higher VRAM.")
+
+    # Optionally pin the DiT fully-resident on GPU so ComfyUI never pages the
+    # 22B weights through host RAM (the mid-sampling OOM path). Only enable when
+    # the chosen quant fits VRAM with headroom (see DIT_QUANT notes).
+    if FORCE_GPU_RESIDENT_DIT:
+        try:
+            import comfy.model_management as mm
+            if hasattr(mm, "VRAMState") and hasattr(mm, "vram_state"):
+                mm.vram_state = mm.VRAMState.HIGH_VRAM
+            try:
+                mm.load_models_gpu([model], force_full_load=True)
+            except TypeError:
+                mm.load_models_gpu([model])
+            print("  ✓ DiT pinned fully-resident on GPU (host-RAM offload disabled).")
+        except Exception as e:
+            print(f"  [Notice] Could not pin DiT to GPU (continuing with smart offload): {e}")
+
+    # Residency diagnostic: if 'GPU Alloc' is far below the model size, ComfyUI is
+    # streaming weights from host RAM -> that is why each step takes minutes.
+    _s = LTXDirectorMemoryManager.get_memory_stats()
+    print(f"  📊 Post-load: GPU Alloc {_s['gpu_alloc_gb']:.2f} GB | GPU Free {_s['gpu_free_gb']:.2f} GB | "
+          f"RAM Free {_s['ram_avail_gb']:.2f} GB  (low Alloc => offloading => slow)")
 
     return model
 
@@ -1322,6 +1558,7 @@ def execute_phase_a_ltxdirector(
         return torch.load(state_file, map_location="cpu")
 
     LTXDirectorMemoryManager.purge("pre_phase_a")
+    ram_guard(min_free_gb=min_ram_guard_gb, tag="phase_a_start")
     LTXDirectorMemoryManager.print_diagnostics(phase="PHASE A: LTXDirector Ingestion", node="LTXDirector")
 
     with torch.inference_mode():
@@ -1461,7 +1698,8 @@ def execute_segment_wise_diffusion_pipeline(
     """
     segments = director_state.get("segments", ORIGINAL_SEGMENTS)
     total_segments = len(segments)
-    completed_segment_packs = []
+    # RAM-SAFE: collect on-disk paths, NOT resident latent packs.
+    completed_segment_paths: List[str] = []
 
     print("\n" + "="*70 + f"\n🎬 PHASE B: EXECUTING {total_segments} DIRECTOR SEGMENTS (MEMORY-SAFE)\n" + "="*70)
 
@@ -1489,12 +1727,13 @@ def execute_segment_wise_diffusion_pipeline(
         print(f"\n{'─'*65}\n🎬 {seg_name} | Frames: {valid_frames} (Latent Frames: {cur_lat_idx} -> {end_lat_idx})\n{'─'*65}")
 
         if resume and os.path.exists(seg_cache_file) and os.path.getsize(seg_cache_file) > 1024:
-            print(f"  ⏭ [RESUME] Loading cached Stage 2 segment latent from: {seg_cache_file}")
-            completed_segment_packs.append(torch.load(seg_cache_file, map_location="cpu"))
+            print(f"  ⏭ [RESUME] Found cached Stage 2 segment latent: {seg_cache_file}")
+            completed_segment_paths.append(seg_cache_file)
             cur_lat_idx = end_lat_idx
             continue
 
         LTXDirectorMemoryManager.purge(f"pre_seg_{idx+1}")
+        ram_guard(min_free_gb=min_ram_guard_gb, tag=f"seg_{idx+1}_start")
 
         # Dimension-agnostic temporal slicing
         seg_vid_lat = {"samples": slice_temporal_latent(full_vid_tensor, cur_lat_idx, end_lat_idx)}
@@ -1516,11 +1755,11 @@ def execute_segment_wise_diffusion_pipeline(
                 "guide_data": director_state["guide_data"],
                 "motion_guide_data": director_state["motion_guide_data"],
                 "model": model,
-                "strength": 0.5,
+                "strength": float(stage1_guide_strength),
                 "rescale_method": "None",
-                "guide_frame": 1,
-                "interpolation": "bicubic",
-                "crop_position": "center",
+                "guide_frame": int(guide_frame),
+                "interpolation": guide_interpolation,
+                "crop_position": guide_crop_position,
                 "enable_guide": True
             }
             guide1_res = call_original_node("LTXDirectorGuide", node_instance=guide1_node, **guide1_params)
@@ -1544,27 +1783,28 @@ def execute_segment_wise_diffusion_pipeline(
             noise1 = gv(call_original_node("RandomNoise", node_instance=noise_node, noise_seed=seed + idx * 100), 0)
 
             guider_node = NODE_CLASS_MAPPINGS["CFGGuider"]()
-            guider1 = gv(call_original_node("CFGGuider", node_instance=guider_node, cfg=1.0, model=s1_model, positive=s1_pos, negative=s1_neg), 0)
+            guider1 = gv(call_original_node("CFGGuider", node_instance=guider_node, cfg=float(sampler_cfg), model=s1_model, positive=s1_pos, negative=s1_neg), 0)
 
             sampler_select_node = NODE_CLASS_MAPPINGS["KSamplerSelect"]()
-            sampler_euler = gv(call_original_node("KSamplerSelect", node_instance=sampler_select_node, sampler_name="euler"), 0)
+            sampler_euler = gv(call_original_node("KSamplerSelect", node_instance=sampler_select_node, sampler_name=sampler_name), 0)
 
             scheduler_node = NODE_CLASS_MAPPINGS["BasicScheduler"]()
             sigmas1 = gv(call_original_node(
                 "BasicScheduler",
                 node_instance=scheduler_node,
                 model=s1_model,
-                scheduler="linear_quadratic",
-                steps=8,
-                denoise=1.0
+                scheduler=scheduler_name,
+                steps=int(stage1_steps),
+                denoise=float(stage1_denoise)
             ), 0)
 
-            print(f"  ⚡ Sampling Stage 1 for {seg_name} (8 steps)...")
+            print(f"  ⚡ Sampling Stage 1 for {seg_name} ({int(stage1_steps)} steps)...")
             t_s1 = time.time()
             sampler_custom_node = NODE_CLASS_MAPPINGS["SamplerCustomAdvanced"]()
-            s1_out = call_original_node(
-                "SamplerCustomAdvanced",
-                node_instance=sampler_custom_node,
+            soft_gpu_clear()
+            s1_out = run_sampler_with_fallback(
+                sampler_custom_node,
+                stage_tag="Stage 1",
                 noise=noise1,
                 guider=guider1,
                 sampler=sampler_euler,
@@ -1573,6 +1813,8 @@ def execute_segment_wise_diffusion_pipeline(
             )
             s1_lat = sync_latent_device(gv(s1_out, 0), "cpu")
             print(f"  ✓ Stage 1 Finished in {time.time() - t_s1:.2f}s!")
+            del av1_in
+            soft_gpu_clear()
 
             sep_node = NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"]()
             sep1 = call_original_node("LTXVSeparateAVLatent", node_instance=sep_node, av_latent=s1_lat)
@@ -1585,67 +1827,87 @@ def execute_segment_wise_diffusion_pipeline(
             crop1_neg = gv(crop1, 1) or s1_neg
             crop1_vid = sync_latent_device(gv(crop1, 2) or v1_raw, "cpu")
 
-            # ────────────────────────────────────────────────────────────────
-            # STEP B2: 2x Latent Spatial Upscaling
-            # ────────────────────────────────────────────────────────────────
-            print("  ⚡ Upscaling Latent 2x via LTXVLatentUpsampler...")
-            upscale_loader = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
-            up_model = gv(call_original_node("LatentUpscaleModelLoader", node_instance=upscale_loader, model_name="ltx-2.3-spatial-upscaler-x2-1.1.safetensors"), 0)
+            if enable_stage2_upscale:
+                # ────────────────────────────────────────────────────────────
+                # STEP B2: 2x Latent Spatial Upscaling
+                # ────────────────────────────────────────────────────────────
+                soft_gpu_clear()
+                print("  ⚡ Upscaling Latent 2x via LTXVLatentUpsampler...")
+                upscale_loader = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
+                up_model = gv(call_original_node("LatentUpscaleModelLoader", node_instance=upscale_loader, model_name="ltx-2.3-spatial-upscaler-x2-1.1.safetensors"), 0)
 
-            upsampler_node = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
-            upscaled_lat_res = call_original_node("LTXVLatentUpsampler", node_instance=upsampler_node, samples=crop1_vid, upscale_model=up_model, vae=video_vae)
-            v_upscaled = sync_latent_device(gv(upscaled_lat_res, 0), "cpu")
+                upsampler_node = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
+                upscaled_lat_res = call_original_node("LTXVLatentUpsampler", node_instance=upsampler_node, samples=crop1_vid, upscale_model=up_model, vae=video_vae)
+                v_upscaled = sync_latent_device(gv(upscaled_lat_res, 0), "cpu")
 
-            del up_model, upscaled_lat_res
+                del up_model, upscaled_lat_res
+                soft_gpu_clear()
 
-            # ────────────────────────────────────────────────────────────────
-            # STEP B3: Stage 2 Refinement (4 steps, denoise 0.42)
-            # ────────────────────────────────────────────────────────────────
-            guide2_node = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]()
-            guide2_params = {
-                "positive": crop1_pos,
-                "negative": crop1_neg,
-                "vae": video_vae,
-                "latent": v_upscaled,
-                "guide_data": director_state["guide_data"],
-                "motion_guide_data": director_state["motion_guide_data"],
-                "model": model,
-                "strength": 1.0,
-                "rescale_method": "None",
-                "guide_frame": 1,
-                "interpolation": "bicubic",
-                "crop_position": "center",
-                "enable_guide": True
-            }
-            guide2_res = call_original_node("LTXDirectorGuide", node_instance=guide2_node, **guide2_params)
-            s2_pos = gv(guide2_res, 0) or crop1_pos
-            s2_neg = gv(guide2_res, 1) or crop1_neg
-            s2_vid = sync_latent_device(gv(guide2_res, 2) or v_upscaled, "cpu")
-            s2_model = gv(guide2_res, 3) or model
+                # ────────────────────────────────────────────────────────────
+                # STEP B3: Stage 2 Refinement (high-res; OOM-guarded)
+                # ────────────────────────────────────────────────────────────
+                guide2_node = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]()
+                guide2_params = {
+                    "positive": crop1_pos,
+                    "negative": crop1_neg,
+                    "vae": video_vae,
+                    "latent": v_upscaled,
+                    "guide_data": director_state["guide_data"],
+                    "motion_guide_data": director_state["motion_guide_data"],
+                    "model": model,
+                    "strength": float(stage2_guide_strength),
+                    "rescale_method": "None",
+                    "guide_frame": int(guide_frame),
+                    "interpolation": guide_interpolation,
+                    "crop_position": guide_crop_position,
+                    "enable_guide": True
+                }
+                guide2_res = call_original_node("LTXDirectorGuide", node_instance=guide2_node, **guide2_params)
+                s2_pos = gv(guide2_res, 0) or crop1_pos
+                s2_neg = gv(guide2_res, 1) or crop1_neg
+                s2_vid = sync_latent_device(gv(guide2_res, 2) or v_upscaled, "cpu")
+                s2_model = gv(guide2_res, 3) or model
 
-            av2_in = sync_latent_device(gv(call_original_node(
-                "LTXVConcatAVLatent",
-                node_instance=concat_node,
-                video_latent=s2_vid,
-                audio_latent=a1_raw
-            ), 0), "cpu")
+                av2_in = sync_latent_device(gv(call_original_node(
+                    "LTXVConcatAVLatent",
+                    node_instance=concat_node,
+                    video_latent=s2_vid,
+                    audio_latent=a1_raw
+                ), 0), "cpu")
 
-            noise2 = gv(call_original_node("RandomNoise", node_instance=noise_node, noise_seed=seed + idx * 100), 0)
-            guider2 = gv(call_original_node("CFGGuider", node_instance=guider_node, cfg=1.0, model=s2_model, positive=s2_pos, negative=s2_neg), 0)
-            sigmas2 = gv(call_original_node("BasicScheduler", node_instance=scheduler_node, model=s2_model, scheduler="linear_quadratic", steps=4, denoise=0.42), 0)
+                noise2 = gv(call_original_node("RandomNoise", node_instance=noise_node, noise_seed=seed + idx * 100), 0)
+                guider2 = gv(call_original_node("CFGGuider", node_instance=guider_node, cfg=float(sampler_cfg), model=s2_model, positive=s2_pos, negative=s2_neg), 0)
+                sigmas2 = gv(call_original_node("BasicScheduler", node_instance=scheduler_node, model=s2_model, scheduler=scheduler_name, steps=int(stage2_steps), denoise=float(stage2_denoise)), 0)
 
-            print(f"  ⚡ Stage 2 Refinement for {seg_name} (4 steps)...")
-            t_s2 = time.time()
-            s2_out = call_original_node("SamplerCustomAdvanced", node_instance=sampler_custom_node, noise=noise2, guider=guider2, sampler=sampler_euler, sigmas=sigmas2, latent_image=av2_in)
-            s2_lat = sync_latent_device(gv(s2_out, 0), "cpu")
-            print(f"  ✓ Stage 2 Finished in {time.time() - t_s2:.2f}s!")
+                print(f"  ⚡ Stage 2 Refinement for {seg_name} ({int(stage2_steps)} steps)...")
+                t_s2 = time.time()
+                soft_gpu_clear()
+                s2_out = run_sampler_with_fallback(
+                    sampler_custom_node,
+                    stage_tag="Stage 2",
+                    noise=noise2,
+                    guider=guider2,
+                    sampler=sampler_euler,
+                    sigmas=sigmas2,
+                    latent_image=av2_in
+                )
+                s2_lat = sync_latent_device(gv(s2_out, 0), "cpu")
+                print(f"  ✓ Stage 2 Finished in {time.time() - t_s2:.2f}s!")
+                del noise2, guider2, s2_out, av2_in, v_upscaled
+                soft_gpu_clear()
 
-            sep2 = call_original_node("LTXVSeparateAVLatent", node_instance=sep_node, av_latent=s2_lat)
-            v2_raw = sync_latent_device(gv(sep2, 0), "cpu")
-            a2_raw = sync_latent_device(gv(sep2, 1), "cpu")
+                sep2 = call_original_node("LTXVSeparateAVLatent", node_instance=sep_node, av_latent=s2_lat)
+                v2_raw = sync_latent_device(gv(sep2, 0), "cpu")
+                a2_raw = sync_latent_device(gv(sep2, 1), "cpu")
 
-            crop2 = call_original_node("LTXDirectorCropGuides", node_instance=crop_node, positive=s2_pos, negative=s2_neg, latent=v2_raw)
-            final_seg_video_lat = sync_latent_device(gv(crop2, 2) or v2_raw, "cpu")
+                crop2 = call_original_node("LTXDirectorCropGuides", node_instance=crop_node, positive=s2_pos, negative=s2_neg, latent=v2_raw)
+                final_seg_video_lat = sync_latent_device(gv(crop2, 2) or v2_raw, "cpu")
+                del s2_lat, v2_raw
+            else:
+                # Stage 2 disabled -> keep the base-res Stage 1 result (fast, low VRAM).
+                print("  ⏩ Stage 2 upscale disabled -> using base-resolution Stage 1 latent.")
+                final_seg_video_lat = crop1_vid
+                a2_raw = a1_raw
 
             seg_pack = {
                 "video_latent": final_seg_video_lat,
@@ -1654,17 +1916,21 @@ def execute_segment_wise_diffusion_pipeline(
                 "valid_frames": valid_frames
             }
 
-            torch.save(seg_pack, seg_cache_file)
-            completed_segment_packs.append(seg_pack)
+            tmp_seg = seg_cache_file + ".tmp"
+            torch.save(seg_pack, tmp_seg)
+            os.replace(tmp_seg, seg_cache_file)
+            completed_segment_paths.append(seg_cache_file)
             print(f"  💾 Saved {seg_name} Latents to: {seg_cache_file}")
 
-            del model, video_vae, noise1, guider1, sigmas1, s1_out, v1_raw, noise2, guider2, sigmas2, s2_out, v2_raw
+            # RAM-SAFE: drop this segment's latents from RAM immediately; Phase C reloads lazily.
+            del seg_pack, final_seg_video_lat, a2_raw
+            del model, video_vae, noise1, guider1, sigmas1, s1_out, v1_raw
 
         cur_lat_idx = end_lat_idx
         LTXDirectorMemoryManager.purge(f"post_seg_{idx+1}")
 
     print("✅ All 5 Director Segments successfully sampled & upscaled!")
-    return completed_segment_packs
+    return completed_segment_paths
 
 print("✅ Cell 13 & 14: Segment-wise Diffusion & Upscale Engine ready.")
 
@@ -1672,69 +1938,111 @@ print("✅ Cell 13 & 14: Segment-wise Diffusion & Upscale Engine ready.")
 # ════════════════════════════════════════════════════════════════════════════
 # CELL 15: PHASE C - MEMORY-SAFE OUT-OF-CORE VAE DECODING
 # ════════════════════════════════════════════════════════════════════════════
+def _decode_one_video_latent(v_lat: Any, video_vae: Any) -> torch.Tensor:
+    """Decode a single segment latent, preferring the memory-safe tiled decoder."""
+    if "LTXVSpatioTemporalTiledVAEDecode" in NODE_CLASS_MAPPINGS:
+        try:
+            tiled_node = NODE_CLASS_MAPPINGS["LTXVSpatioTemporalTiledVAEDecode"]()
+            decoded_res = call_original_node(
+                "LTXVSpatioTemporalTiledVAEDecode",
+                node_instance=tiled_node,
+                vae=video_vae,
+                latents=v_lat,
+                spatial_tiles=2,
+                spatial_overlap=8,
+                temporal_tile_length=16,
+                temporal_overlap=4,
+                last_frame_fix=False,
+                working_device="auto",
+                working_dtype="auto"
+            )
+            return unwrap_tensor(decoded_res)
+        except Exception:
+            pass
+    vae_decode_node = NODE_CLASS_MAPPINGS["VAEDecode"]()
+    decoded_res = call_original_node("VAEDecode", node_instance=vae_decode_node, samples=v_lat, vae=video_vae)
+    return unwrap_tensor(decoded_res)
+
+
 def execute_phase_c_video_decode(
-    segment_packs: List[Dict[str, Any]],
+    segment_pack_paths: List[str],
     workdir: str = "/content/LTXDirector_Work",
-    resume: bool = True
+    resume: bool = True,
+    fps: int = 24,
+    crf: int = 8
 ) -> str:
-    frames_file = os.path.join(workdir, "decoded_video_frames.pt")
-    if resume and os.path.exists(frames_file) and os.path.getsize(frames_file) > 1024:
-        print(f"  ⏭ [RESUME] Loading cached decoded video frames from: {frames_file}")
-        return frames_file
+    """
+    RAM-SAFE streaming decode.
+
+    Previous behavior peaked at ~2x the full 30s frame tensor in host RAM
+    (list-accumulate -> torch.cat -> torch.save -> reload as float in Phase D),
+    which is the primary cause of the 12.2 GB OOM crash.
+
+    New behavior: decode ONE segment at a time and stream its frames straight
+    into a silent H.264 MP4 via an incremental FFMPEG writer. Peak host RAM is
+    now bounded by a single segment (converted to uint8 immediately), never the
+    whole video, and nothing large is ever persisted to a .pt.
+    """
+    import imageio
+
+    silent_video = os.path.join(workdir, "master_video_silent.mp4")
+    if resume and os.path.exists(silent_video) and os.path.getsize(silent_video) > 1024:
+        print(f"  ⏭ [RESUME] Found streamed silent video: {silent_video}")
+        return silent_video
 
     LTXDirectorMemoryManager.purge("pre_video_decode")
-    LTXDirectorMemoryManager.print_diagnostics(phase="PHASE C: Video VAE Decoding", node="VAEDecode")
+    LTXDirectorMemoryManager.print_diagnostics(phase="PHASE C: Video VAE Decoding (streaming)", node="VAEDecode")
 
+    tmp_video = silent_video + ".tmp.mp4"
+    writer = imageio.get_writer(
+        tmp_video,
+        format="FFMPEG",
+        mode="I",
+        fps=int(fps),
+        codec="libx264",
+        pixelformat="yuv420p",
+        output_params=["-crf", str(int(crf))],
+        macro_block_size=None,
+    )
+
+    total_written = 0
     with torch.inference_mode():
         video_vae = gv(call_original_node("VAELoader", vae_name="LTX23_video_vae_bf16.safetensors"), 0)
-        decoded_segment_frames = []
 
-        for idx, pack in enumerate(segment_packs):
+        for idx, seg_path in enumerate(segment_pack_paths):
+            print(f"  🎨 Decoding Segment {idx+1}/{len(segment_pack_paths)} frames via VAE...")
+            pack = torch.load(seg_path, map_location="cpu")
             v_lat = pack["video_latent"]
-            print(f"  🎨 Decoding Segment {idx+1}/{len(segment_packs)} frames via VAE...")
 
-            if "LTXVSpatioTemporalTiledVAEDecode" in NODE_CLASS_MAPPINGS:
-                try:
-                    tiled_node = NODE_CLASS_MAPPINGS["LTXVSpatioTemporalTiledVAEDecode"]()
-                    decoded_res = call_original_node(
-                        "LTXVSpatioTemporalTiledVAEDecode",
-                        node_instance=tiled_node,
-                        vae=video_vae,
-                        latents=v_lat,
-                        spatial_tiles=2,
-                        spatial_overlap=8,
-                        temporal_tile_length=16,
-                        temporal_overlap=4,
-                        last_frame_fix=False,
-                        working_device="auto",
-                        working_dtype="auto"
-                    )
-                    decoded_tensor = unwrap_tensor(decoded_res)
-                except Exception:
-                    vae_decode_node = NODE_CLASS_MAPPINGS["VAEDecode"]()
-                    decoded_res = call_original_node("VAEDecode", node_instance=vae_decode_node, samples=v_lat, vae=video_vae)
-                    decoded_tensor = unwrap_tensor(decoded_res)
-            else:
-                vae_decode_node = NODE_CLASS_MAPPINGS["VAEDecode"]()
-                decoded_res = call_original_node("VAEDecode", node_instance=vae_decode_node, samples=v_lat, vae=video_vae)
-                decoded_tensor = unwrap_tensor(decoded_res)
+            decoded_tensor = _decode_one_video_latent(v_lat, video_vae)
 
-            decoded_segment_frames.append(decoded_tensor.detach().cpu().half())
-            del decoded_tensor
+            # Convert to uint8 (on whichever device it lands) then pull to host as
+            # numpy. This avoids keeping a giant float32 CPU copy around.
+            frames_u8 = (
+                decoded_tensor.detach().clamp(0.0, 1.0).mul_(255.0)
+                .round().to(torch.uint8).cpu().numpy()
+            )
+            del decoded_tensor, pack, v_lat
+
+            n = frames_u8.shape[0]
+            for f in range(n):
+                writer.append_data(frames_u8[f])
+            total_written += n
+            print(f"    + streamed {n} frames (total {total_written})")
+
+            del frames_u8
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        full_video_frames = torch.cat(decoded_segment_frames, dim=0)
-        print(f"  ✓ Full 30s Master Frame Tensor Shape: {full_video_frames.shape}")
+        del video_vae
 
-        tmp_path = frames_file + ".tmp"
-        torch.save(full_video_frames, tmp_path)
-        os.replace(tmp_path, frames_file)
-        print(f"  💾 Decoded Video Frames saved: {frames_file}")
-
-        del video_vae, decoded_segment_frames, full_video_frames
+    writer.close()
+    os.replace(tmp_video, silent_video)
+    print(f"  💾 Streamed silent master video ({total_written} frames): {silent_video}")
 
     LTXDirectorMemoryManager.purge("video_decode_complete")
-    return frames_file
+    return silent_video
 
 print("✅ Cell 15: Video VAE Decoder configured.")
 
@@ -1743,7 +2051,7 @@ print("✅ Cell 15: Video VAE Decoder configured.")
 # CELL 16: PHASE C - AUDIO VAE DECODING & SYNCHRONIZATION
 # ════════════════════════════════════════════════════════════════════════════
 def execute_phase_c_audio_decode(
-    segment_packs: List[Dict[str, Any]],
+    segment_pack_paths: List[str],
     workdir: str = "/content/LTXDirector_Work",
     resume: bool = True
 ) -> str:
@@ -1759,12 +2067,25 @@ def execute_phase_c_audio_decode(
         audio_vae = gv(call_original_node("VAELoader", vae_name="LTX23_audio_vae_bf16.safetensors"), 0)
         audio_decode_node = NODE_CLASS_MAPPINGS["LTXVAudioVAEDecode"]()
 
-        aud_lat_list = [unwrap_latent(p["audio_latent"])["samples"] for p in segment_packs if unwrap_latent(p["audio_latent"])["samples"] is not None]
+        # RAM-SAFE: load each segment's (small) audio latent lazily from disk,
+        # keep only the audio tensor, and release the rest of the pack.
+        aud_lat_list = []
+        fallback_aud = None
+        for seg_path in segment_pack_paths:
+            pack = torch.load(seg_path, map_location="cpu")
+            if fallback_aud is None:
+                fallback_aud = pack.get("audio_latent")
+            samp = unwrap_latent(pack.get("audio_latent"))["samples"]
+            if samp is not None:
+                aud_lat_list.append(samp)
+            del pack
+
         if aud_lat_list:
             combined_aud_samples = concat_temporal_latents(aud_lat_list)
             combined_aud_lat = {"samples": combined_aud_samples}
         else:
-            combined_aud_lat = segment_packs[0]["audio_latent"]
+            combined_aud_lat = fallback_aud
+        del aud_lat_list
 
         print("  🎵 Decoding audio latent stream via LTXVAudioVAEDecode...")
         aud_res = call_original_node(
@@ -1794,6 +2115,41 @@ print("✅ Cell 16: Audio VAE Decoder configured.")
 # ════════════════════════════════════════════════════════════════════════════
 import numpy as np
 
+def _write_audio_dict_to_wav(audio_dict: Any, wav_path: str, default_sr: int = 48000) -> bool:
+    """Write a ComfyUI AUDIO dict ({'waveform': [B,C,N], 'sample_rate': int}) to WAV."""
+    try:
+        if audio_dict is None:
+            return False
+        wav = None
+        sr = default_sr
+        if isinstance(audio_dict, dict):
+            wav = audio_dict.get("waveform", None)
+            sr = int(audio_dict.get("sample_rate", default_sr))
+        elif isinstance(audio_dict, torch.Tensor):
+            wav = audio_dict
+        wav = unwrap_tensor(wav)
+        if not isinstance(wav, torch.Tensor):
+            return False
+        w = wav.detach().cpu().float()
+        while w.dim() > 2:          # [B, C, N] -> [C, N]
+            w = w[0]
+        if w.dim() == 1:            # [N] -> [1, N]
+            w = w.unsqueeze(0)
+        w = w.clamp(-1.0, 1.0)
+        try:
+            import torchaudio
+            torchaudio.save(wav_path, w, sr)
+            return True
+        except Exception:
+            from scipy.io import wavfile
+            arr = (w.transpose(0, 1).numpy() * 32767.0).astype(np.int16)  # [N, C]
+            wavfile.write(wav_path, sr, arr)
+            return True
+    except Exception as e:
+        print(f"  [Notice] Could not write decoded audio WAV: {e}")
+        return False
+
+
 def execute_phase_d_vhs_combine(
     frames_file_path: str,
     audio_file_path: str,
@@ -1801,67 +2157,56 @@ def execute_phase_d_vhs_combine(
     crf: int = 8,
     outdir: str = "/content/LTXStudio_Output"
 ) -> str:
+    """
+    RAM-SAFE final assembly.
+
+    `frames_file_path` is now the already-encoded SILENT MP4 produced by the
+    streaming Phase C decoder (not a giant frame tensor). We simply mux audio
+    onto it with a stream copy (`-c:v copy`), so no frames are ever loaded into
+    host RAM here.
+    """
     os.makedirs(outdir, exist_ok=True)
     final_output_path = os.path.join(outdir, "LTX23_Director_Master_30s.mp4")
+    silent_video = frames_file_path
 
-    LTXDirectorMemoryManager.purge("pre_vhs_combine")
-    LTXDirectorMemoryManager.print_diagnostics(phase="PHASE D: Final VHS Assembly", node="VHS_VideoCombine")
+    LTXDirectorMemoryManager.purge("pre_final_mux")
+    LTXDirectorMemoryManager.print_diagnostics(phase="PHASE D: Final Mux (stream-copy)", node="ffmpeg")
 
-    frames_tensor = torch.load(frames_file_path, map_location="cpu").float()
-    audio_dict = torch.load(audio_file_path, map_location="cpu") if os.path.exists(audio_file_path) else None
+    if not os.path.exists(silent_video) or os.path.getsize(silent_video) < 1024:
+        raise RuntimeError(f"Silent master video missing for mux: {silent_video}")
 
-    print(f"  🎬 Combining {frames_tensor.shape[0]} frames @ {fps} fps with synchronized audio...")
+    # 1) Preferred: mux the model-generated (lip-synced) audio decoded in Phase C.
+    audio_dict = torch.load(audio_file_path, map_location="cpu") if (audio_file_path and os.path.exists(audio_file_path)) else None
+    gen_wav = os.path.join(outdir, "generated_audio.wav")
+    have_gen_audio = _write_audio_dict_to_wav(audio_dict, gen_wav)
+    del audio_dict
+    gc.collect()
 
-    vhs_node = NODE_CLASS_MAPPINGS["VHS_VideoCombine"]()
-    vhs_params = {
-        "images": frames_tensor,
-        "audio": audio_dict,
-        "frame_rate": float(fps),
-        "loop_count": 0,
-        "filename_prefix": "LTX23_Director_Master",
-        "format": "video/h264-mp4",
-        "pix_fmt": "yuv420p",
-        "crf": int(crf),
-        "save_metadata": False,
-        "trim_to_audio": False,
-        "pingpong": False,
-        "save_output": True
-    }
+    muxed = False
+    if have_gen_audio:
+        print("  🎬 Muxing streamed video with generated (lip-synced) audio via stream-copy...")
+        cmd = (f'ffmpeg -y -i "{silent_video}" -i "{gen_wav}" '
+               f'-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 320k -shortest "{final_output_path}"')
+        if run_cmd(cmd, silent=False) == 0 and os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 1024:
+            muxed = True
 
-    video_combined = False
-    try:
-        res = call_original_node("VHS_VideoCombine", node_instance=vhs_node, **vhs_params)
-        if res and isinstance(res, (tuple, list)) and len(res) > 0:
-            filenames_dict = gv(res, 0)
-            if isinstance(filenames_dict, dict) and "ui" in filenames_dict and "gifs" in filenames_dict["ui"]:
-                generated_path = filenames_dict["ui"]["gifs"][0].get("fullpath", "")
-                if os.path.exists(generated_path):
-                    shutil.copyfile(generated_path, final_output_path)
-                    video_combined = True
-    except Exception as e:
-        print(f"  [Notice] Direct VHS node invocation fallback: {e}")
-
-    if not video_combined or not os.path.exists(final_output_path):
-        import imageio
-        raw_temp_mp4 = os.path.join(outdir, "temp_raw_video.mp4")
-        frames_np = (frames_tensor.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
-        imageio.mimwrite(raw_temp_mp4, frames_np, fps=fps, quality=9)
-
+    # 2) Fallback: mux the trimmed original backing track.
+    if not muxed:
         raw_song_path = "/content/ComfyUI/input/whatdreamscost/Late night trap.mp3"
         if os.path.exists(raw_song_path):
-            trim_sec = 446.9222739141953 / fps
-            dur_sec = frames_tensor.shape[0] / fps
-            cmd = (f'ffmpeg -y -i "{raw_temp_mp4}" -ss {trim_sec} -t {dur_sec} -i "{raw_song_path}" '
-                   f'-map 0:v:0 -map 1:a:0 -c:v libx264 -crf {crf} -pix_fmt yuv420p '
-                   f'-c:a aac -b:a 320k -shortest "{final_output_path}"')
-            run_cmd(cmd, silent=False)
-            if os.path.exists(raw_temp_mp4):
-                os.remove(raw_temp_mp4)
-        else:
-            shutil.move(raw_temp_mp4, final_output_path)
+            print("  🎬 [Fallback] Muxing streamed video with trimmed backing track...")
+            trim_sec = 446.9222739141953 / float(fps)
+            cmd = (f'ffmpeg -y -i "{silent_video}" -ss {trim_sec} -i "{raw_song_path}" '
+                   f'-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 320k -shortest "{final_output_path}"')
+            if run_cmd(cmd, silent=False) == 0 and os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 1024:
+                muxed = True
 
-    del frames_tensor, audio_dict
-    LTXDirectorMemoryManager.purge("vhs_cleanup")
+    # 3) Last resort: ship the silent video as the final output.
+    if not muxed:
+        print("  [Notice] No audio available; delivering silent master video.")
+        shutil.copyfile(silent_video, final_output_path)
+
+    LTXDirectorMemoryManager.purge("final_mux_cleanup")
     print(f"  🎉 Final Render Complete: {final_output_path}")
     return final_output_path
 
@@ -1890,17 +2235,21 @@ print("✅ Cell 18: Artifact Verifier ready.")
 # ════════════════════════════════════════════════════════════════════════════
 # CELL 19: RUNTIME CONFIGURATION & QUALITY DEBUG MODE
 # ════════════════════════════════════════════════════════════════════════════
-DEBUG_MODE = False
-DEBUG_MAX_FRAMES = 120
-BASE_SEED = 2026
-SEED_MODE = "fixed"
-RESUME_CHECKPOINTS = True
-OUTPUT_CRF = 8
+# All runtime knobs come from the Master Settings cell.
+DEBUG_MODE = bool(debug_mode)
+DEBUG_MAX_FRAMES = int(debug_max_frames)
+if str(seed_mode).lower() == "random":
+    BASE_SEED = int.from_bytes(os.urandom(4), "big")
+else:
+    BASE_SEED = int(base_seed)
+SEED_MODE = seed_mode
+RESUME_CHECKPOINTS = bool(resume_checkpoints)
+OUTPUT_CRF = int(output_crf)
 
 WORK_DIRECTORY = "/content/LTXDirector_Work"
 OUTPUT_DIRECTORY = "/content/LTXStudio_Output"
 
-print(f"✅ Cell 19: Runtime Configured (Debug Mode: {DEBUG_MODE} | Seed: {BASE_SEED})")
+print(f"✅ Cell 19: Runtime Configured (Debug: {DEBUG_MODE} | Seed: {BASE_SEED} [{SEED_MODE}] | CRF: {OUTPUT_CRF} | Resume: {RESUME_CHECKPOINTS})")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1923,6 +2272,8 @@ def run_ltx23_director_original_workflow(
     print("\n" + "="*70 + "\n🎬 STARTING LTX-2.3 DIRECTOR 2.0 WORKFLOW GENERATION\n" + "="*70)
 
     validate_original_nodes()
+    patch_comfy_memory_safety()
+    patch_safetensors_direct_to_gpu()
 
     active_metadata = dict(timeline_metadata)
     active_segments = list(segments)
@@ -1947,28 +2298,36 @@ def run_ltx23_director_original_workflow(
     )
 
     # Phase B: Segment-Wise Diffusion (Stage 1 & 2 Latent Diffusion per Director Segment)
-    segment_packs = execute_segment_wise_diffusion_pipeline(
+    # Returns on-disk latent PATHS (not resident tensors) to keep host RAM flat.
+    segment_pack_paths = execute_segment_wise_diffusion_pipeline(
         director_state=director_state,
         seed=seed,
         workdir=workdir,
         resume=resume
     )
 
-    # Phase C: Video VAE Decoding -> Immediate Purge
+    # RAM-SAFE: Phase C/D read segment latents lazily from disk, so release the
+    # full Director latents + conditioning before decoding.
+    del director_state
+    LTXDirectorMemoryManager.purge("post_phase_b")
+
+    # Phase C: Video VAE Decoding -> streamed straight to a silent MP4
     frames_path = execute_phase_c_video_decode(
-        segment_packs=segment_packs,
+        segment_pack_paths=segment_pack_paths,
         workdir=workdir,
-        resume=resume
+        resume=resume,
+        fps=int(active_metadata["frame_rate"]),
+        crf=crf
     )
 
     # Phase C: Audio VAE Decoding -> Immediate Purge
     audio_path = execute_phase_c_audio_decode(
-        segment_packs=segment_packs,
+        segment_pack_paths=segment_pack_paths,
         workdir=workdir,
         resume=resume
     )
 
-    # Phase D: Final VHS Assembly
+    # Phase D: Final Mux (stream-copy, no frames in RAM)
     final_video = execute_phase_d_vhs_combine(
         frames_file_path=frames_path,
         audio_file_path=audio_path,
