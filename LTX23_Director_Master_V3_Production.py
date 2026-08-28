@@ -190,8 +190,13 @@ force_gpu_resident_dit = True   # @param {type:"boolean"}
 
 # @markdown ### ⚡ Performance (speed vs VRAM)
 # @markdown `ff_chunks`: 0 = fastest (no FFN chunking, needs most VRAM) · 8 = slowest/safest. Try 0 or 2 once the model fits.
-ff_chunks = 2                   # @param [0, 1, 2, 4, 8] {type:"raw"}
+ff_chunks = 4                   # @param [0, 1, 2, 4, 8] {type:"raw"}
 use_sage_attention = False      # @param {type:"boolean"}
+# @markdown `enable_stage2_upscale`: OFF = decode at base res only. Skips the heavy,
+# @markdown OOM-prone 2x refinement -> ~2-3x FASTER and far less VRAM (lower final res).
+enable_stage2_upscale = True    # @param {type:"boolean"}
+# @markdown Auto-recover from CUDA OOM by clearing VRAM and retrying with CPU offload.
+auto_vram_oom_fallback = True   # @param {type:"boolean"}
 
 # @markdown ### 🖥️ Resolution & Output
 custom_width = 1280            # @param [768, 832, 960, 1024, 1152, 1280] {type:"raw"}
@@ -735,6 +740,52 @@ class LTXDirectorMemoryManager:
         gc.collect()
         LTXDirectorMemoryManager.drop_os_page_cache()
         malloc_trim_os()
+
+
+def soft_gpu_clear():
+    """Lightweight GPU-VRAM clear WITHOUT unloading models (fast, call between steps)."""
+    try:
+        import comfy.model_management as mm
+        mm.soft_empty_cache()
+    except Exception:
+        pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+def set_vram_mode(high: bool) -> bool:
+    """Switch ComfyUI between keep-on-GPU (HIGH) and allow-CPU-offload (NORMAL)."""
+    try:
+        import comfy.model_management as mm
+        if hasattr(mm, "VRAMState") and hasattr(mm, "vram_state"):
+            mm.vram_state = mm.VRAMState.HIGH_VRAM if high else mm.VRAMState.NORMAL_VRAM
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def run_sampler_with_fallback(sampler_custom_node, stage_tag: str = "", **sampler_kwargs):
+    """
+    Run SamplerCustomAdvanced with automatic CUDA-OOM recovery.
+    On OOM: clear VRAM, allow ComfyUI to offload layers to CPU (NORMAL_VRAM), and
+    retry once. This lets the heavy 2x Stage-2 pass complete on a 15 GB T4 instead
+    of hard-crashing (it runs slower while offloading, but it finishes).
+    """
+    try:
+        return call_original_node("SamplerCustomAdvanced", node_instance=sampler_custom_node, **sampler_kwargs)
+    except Exception as e:
+        msg = str(e).lower()
+        is_oom = ("out of memory" in msg) or ("outofmemory" in msg) or ("cuda error" in msg)
+        if auto_vram_oom_fallback and is_oom:
+            print(f"  ⚠️ CUDA OOM during {stage_tag} sampling -> clearing VRAM and retrying with CPU offload...")
+            soft_gpu_clear()
+            set_vram_mode(False)  # allow partial offload so the activation pool fits
+            soft_gpu_clear()
+            return call_original_node("SamplerCustomAdvanced", node_instance=sampler_custom_node, **sampler_kwargs)
+        raise
 
 
 def ram_guard(min_free_gb: float = 2.0, tag: str = ""):
@@ -1750,9 +1801,10 @@ def execute_segment_wise_diffusion_pipeline(
             print(f"  ⚡ Sampling Stage 1 for {seg_name} ({int(stage1_steps)} steps)...")
             t_s1 = time.time()
             sampler_custom_node = NODE_CLASS_MAPPINGS["SamplerCustomAdvanced"]()
-            s1_out = call_original_node(
-                "SamplerCustomAdvanced",
-                node_instance=sampler_custom_node,
+            soft_gpu_clear()
+            s1_out = run_sampler_with_fallback(
+                sampler_custom_node,
+                stage_tag="Stage 1",
                 noise=noise1,
                 guider=guider1,
                 sampler=sampler_euler,
@@ -1761,6 +1813,8 @@ def execute_segment_wise_diffusion_pipeline(
             )
             s1_lat = sync_latent_device(gv(s1_out, 0), "cpu")
             print(f"  ✓ Stage 1 Finished in {time.time() - t_s1:.2f}s!")
+            del av1_in
+            soft_gpu_clear()
 
             sep_node = NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"]()
             sep1 = call_original_node("LTXVSeparateAVLatent", node_instance=sep_node, av_latent=s1_lat)
@@ -1773,67 +1827,87 @@ def execute_segment_wise_diffusion_pipeline(
             crop1_neg = gv(crop1, 1) or s1_neg
             crop1_vid = sync_latent_device(gv(crop1, 2) or v1_raw, "cpu")
 
-            # ────────────────────────────────────────────────────────────────
-            # STEP B2: 2x Latent Spatial Upscaling
-            # ────────────────────────────────────────────────────────────────
-            print("  ⚡ Upscaling Latent 2x via LTXVLatentUpsampler...")
-            upscale_loader = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
-            up_model = gv(call_original_node("LatentUpscaleModelLoader", node_instance=upscale_loader, model_name="ltx-2.3-spatial-upscaler-x2-1.1.safetensors"), 0)
+            if enable_stage2_upscale:
+                # ────────────────────────────────────────────────────────────
+                # STEP B2: 2x Latent Spatial Upscaling
+                # ────────────────────────────────────────────────────────────
+                soft_gpu_clear()
+                print("  ⚡ Upscaling Latent 2x via LTXVLatentUpsampler...")
+                upscale_loader = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
+                up_model = gv(call_original_node("LatentUpscaleModelLoader", node_instance=upscale_loader, model_name="ltx-2.3-spatial-upscaler-x2-1.1.safetensors"), 0)
 
-            upsampler_node = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
-            upscaled_lat_res = call_original_node("LTXVLatentUpsampler", node_instance=upsampler_node, samples=crop1_vid, upscale_model=up_model, vae=video_vae)
-            v_upscaled = sync_latent_device(gv(upscaled_lat_res, 0), "cpu")
+                upsampler_node = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
+                upscaled_lat_res = call_original_node("LTXVLatentUpsampler", node_instance=upsampler_node, samples=crop1_vid, upscale_model=up_model, vae=video_vae)
+                v_upscaled = sync_latent_device(gv(upscaled_lat_res, 0), "cpu")
 
-            del up_model, upscaled_lat_res
+                del up_model, upscaled_lat_res
+                soft_gpu_clear()
 
-            # ────────────────────────────────────────────────────────────────
-            # STEP B3: Stage 2 Refinement (4 steps, denoise 0.42)
-            # ────────────────────────────────────────────────────────────────
-            guide2_node = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]()
-            guide2_params = {
-                "positive": crop1_pos,
-                "negative": crop1_neg,
-                "vae": video_vae,
-                "latent": v_upscaled,
-                "guide_data": director_state["guide_data"],
-                "motion_guide_data": director_state["motion_guide_data"],
-                "model": model,
-                "strength": float(stage2_guide_strength),
-                "rescale_method": "None",
-                "guide_frame": int(guide_frame),
-                "interpolation": guide_interpolation,
-                "crop_position": guide_crop_position,
-                "enable_guide": True
-            }
-            guide2_res = call_original_node("LTXDirectorGuide", node_instance=guide2_node, **guide2_params)
-            s2_pos = gv(guide2_res, 0) or crop1_pos
-            s2_neg = gv(guide2_res, 1) or crop1_neg
-            s2_vid = sync_latent_device(gv(guide2_res, 2) or v_upscaled, "cpu")
-            s2_model = gv(guide2_res, 3) or model
+                # ────────────────────────────────────────────────────────────
+                # STEP B3: Stage 2 Refinement (high-res; OOM-guarded)
+                # ────────────────────────────────────────────────────────────
+                guide2_node = NODE_CLASS_MAPPINGS["LTXDirectorGuide"]()
+                guide2_params = {
+                    "positive": crop1_pos,
+                    "negative": crop1_neg,
+                    "vae": video_vae,
+                    "latent": v_upscaled,
+                    "guide_data": director_state["guide_data"],
+                    "motion_guide_data": director_state["motion_guide_data"],
+                    "model": model,
+                    "strength": float(stage2_guide_strength),
+                    "rescale_method": "None",
+                    "guide_frame": int(guide_frame),
+                    "interpolation": guide_interpolation,
+                    "crop_position": guide_crop_position,
+                    "enable_guide": True
+                }
+                guide2_res = call_original_node("LTXDirectorGuide", node_instance=guide2_node, **guide2_params)
+                s2_pos = gv(guide2_res, 0) or crop1_pos
+                s2_neg = gv(guide2_res, 1) or crop1_neg
+                s2_vid = sync_latent_device(gv(guide2_res, 2) or v_upscaled, "cpu")
+                s2_model = gv(guide2_res, 3) or model
 
-            av2_in = sync_latent_device(gv(call_original_node(
-                "LTXVConcatAVLatent",
-                node_instance=concat_node,
-                video_latent=s2_vid,
-                audio_latent=a1_raw
-            ), 0), "cpu")
+                av2_in = sync_latent_device(gv(call_original_node(
+                    "LTXVConcatAVLatent",
+                    node_instance=concat_node,
+                    video_latent=s2_vid,
+                    audio_latent=a1_raw
+                ), 0), "cpu")
 
-            noise2 = gv(call_original_node("RandomNoise", node_instance=noise_node, noise_seed=seed + idx * 100), 0)
-            guider2 = gv(call_original_node("CFGGuider", node_instance=guider_node, cfg=float(sampler_cfg), model=s2_model, positive=s2_pos, negative=s2_neg), 0)
-            sigmas2 = gv(call_original_node("BasicScheduler", node_instance=scheduler_node, model=s2_model, scheduler=scheduler_name, steps=int(stage2_steps), denoise=float(stage2_denoise)), 0)
+                noise2 = gv(call_original_node("RandomNoise", node_instance=noise_node, noise_seed=seed + idx * 100), 0)
+                guider2 = gv(call_original_node("CFGGuider", node_instance=guider_node, cfg=float(sampler_cfg), model=s2_model, positive=s2_pos, negative=s2_neg), 0)
+                sigmas2 = gv(call_original_node("BasicScheduler", node_instance=scheduler_node, model=s2_model, scheduler=scheduler_name, steps=int(stage2_steps), denoise=float(stage2_denoise)), 0)
 
-            print(f"  ⚡ Stage 2 Refinement for {seg_name} ({int(stage2_steps)} steps)...")
-            t_s2 = time.time()
-            s2_out = call_original_node("SamplerCustomAdvanced", node_instance=sampler_custom_node, noise=noise2, guider=guider2, sampler=sampler_euler, sigmas=sigmas2, latent_image=av2_in)
-            s2_lat = sync_latent_device(gv(s2_out, 0), "cpu")
-            print(f"  ✓ Stage 2 Finished in {time.time() - t_s2:.2f}s!")
+                print(f"  ⚡ Stage 2 Refinement for {seg_name} ({int(stage2_steps)} steps)...")
+                t_s2 = time.time()
+                soft_gpu_clear()
+                s2_out = run_sampler_with_fallback(
+                    sampler_custom_node,
+                    stage_tag="Stage 2",
+                    noise=noise2,
+                    guider=guider2,
+                    sampler=sampler_euler,
+                    sigmas=sigmas2,
+                    latent_image=av2_in
+                )
+                s2_lat = sync_latent_device(gv(s2_out, 0), "cpu")
+                print(f"  ✓ Stage 2 Finished in {time.time() - t_s2:.2f}s!")
+                del noise2, guider2, s2_out, av2_in, v_upscaled
+                soft_gpu_clear()
 
-            sep2 = call_original_node("LTXVSeparateAVLatent", node_instance=sep_node, av_latent=s2_lat)
-            v2_raw = sync_latent_device(gv(sep2, 0), "cpu")
-            a2_raw = sync_latent_device(gv(sep2, 1), "cpu")
+                sep2 = call_original_node("LTXVSeparateAVLatent", node_instance=sep_node, av_latent=s2_lat)
+                v2_raw = sync_latent_device(gv(sep2, 0), "cpu")
+                a2_raw = sync_latent_device(gv(sep2, 1), "cpu")
 
-            crop2 = call_original_node("LTXDirectorCropGuides", node_instance=crop_node, positive=s2_pos, negative=s2_neg, latent=v2_raw)
-            final_seg_video_lat = sync_latent_device(gv(crop2, 2) or v2_raw, "cpu")
+                crop2 = call_original_node("LTXDirectorCropGuides", node_instance=crop_node, positive=s2_pos, negative=s2_neg, latent=v2_raw)
+                final_seg_video_lat = sync_latent_device(gv(crop2, 2) or v2_raw, "cpu")
+                del s2_lat, v2_raw
+            else:
+                # Stage 2 disabled -> keep the base-res Stage 1 result (fast, low VRAM).
+                print("  ⏩ Stage 2 upscale disabled -> using base-resolution Stage 1 latent.")
+                final_seg_video_lat = crop1_vid
+                a2_raw = a1_raw
 
             seg_pack = {
                 "video_latent": final_seg_video_lat,
@@ -1850,7 +1924,7 @@ def execute_segment_wise_diffusion_pipeline(
 
             # RAM-SAFE: drop this segment's latents from RAM immediately; Phase C reloads lazily.
             del seg_pack, final_seg_video_lat, a2_raw
-            del model, video_vae, noise1, guider1, sigmas1, s1_out, v1_raw, noise2, guider2, sigmas2, s2_out, v2_raw
+            del model, video_vae, noise1, guider1, sigmas1, s1_out, v1_raw
 
         cur_lat_idx = end_lat_idx
         LTXDirectorMemoryManager.purge(f"post_seg_{idx+1}")
