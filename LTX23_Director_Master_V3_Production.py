@@ -38,6 +38,10 @@ from typing import Sequence, Mapping, Any, Union, Dict, List, Optional, Tuple
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,garbage_collection_threshold:0.8'
 os.environ['TORCH_CUDNN_V8_API_ENABLED'] = '1'
 os.environ['MALLOC_TRIM_THRESHOLD_'] = '65536'
+# Cap glibc malloc arenas: the pipeline repeatedly allocates/frees multi-GB
+# buffers (GGUF reloads, VAE decodes). Without this, glibc spawns many per-thread
+# arenas and host RAM balloons via fragmentation on a 12.2 GB Colab box.
+os.environ['MALLOC_ARENA_MAX'] = '2'
 
 def run_cmd(cmd: str, silent: bool = True) -> int:
     if silent:
@@ -1003,9 +1007,9 @@ def call_original_node(node_name: str, node_instance: Optional[Any] = None, **kw
             for group in ["required", "optional", "hidden"]:
                 group_dict = it.get(group, {})
                 for p_name, p_spec in group_dict.items():
-                    if isinstance(p_spec, tuple) and len(p_spec) > 1 and isinstance(p_spec, dict) and "default" in p_spec:
-                        comfy_schema_defaults[p_name] = p_spec["default"]
-                    elif isinstance(p_spec, tuple) and len(p_spec) > 0 and isinstance(p_spec[0], list) and len(p_spec[0]) > 0:
+                    if isinstance(p_spec, (tuple, list)) and len(p_spec) > 1 and isinstance(p_spec[1], dict) and "default" in p_spec[1]:
+                        comfy_schema_defaults[p_name] = p_spec[1]["default"]
+                    elif isinstance(p_spec, (tuple, list)) and len(p_spec) > 0 and isinstance(p_spec[0], list) and len(p_spec[0]) > 0:
                         comfy_schema_defaults[p_name] = p_spec[0][0]
         except Exception:
             pass
@@ -1282,8 +1286,8 @@ def load_dit_and_loras():
         ]:
             if os.path.exists(os.path.join("/content/ComfyUI/models/loras", lora_cfg[0])):
                 ll = LoraLoaderModelOnly()
-                model = gv(ll.load_lora_model_only(model=model, lora_name=lora_cfg[0], strength_model=lora_cfg), 0)
-                print(f"    + LoRA applied: {lora_cfg[0]} (Strength {lora_cfg})")
+                model = gv(ll.load_lora_model_only(model=model, lora_name=lora_cfg[0], strength_model=lora_cfg[1]), 0)
+                print(f"    + LoRA applied: {lora_cfg[0]} (Strength {lora_cfg[1]})")
 
     # SageAttention & Chunk Feed Forward Hooks
     if "PatchSageAttentionKJ" in NODE_CLASS_MAPPINGS:
@@ -1461,7 +1465,8 @@ def execute_segment_wise_diffusion_pipeline(
     """
     segments = director_state.get("segments", ORIGINAL_SEGMENTS)
     total_segments = len(segments)
-    completed_segment_packs = []
+    # RAM-SAFE: collect on-disk paths, NOT resident latent packs.
+    completed_segment_paths: List[str] = []
 
     print("\n" + "="*70 + f"\n🎬 PHASE B: EXECUTING {total_segments} DIRECTOR SEGMENTS (MEMORY-SAFE)\n" + "="*70)
 
@@ -1489,8 +1494,8 @@ def execute_segment_wise_diffusion_pipeline(
         print(f"\n{'─'*65}\n🎬 {seg_name} | Frames: {valid_frames} (Latent Frames: {cur_lat_idx} -> {end_lat_idx})\n{'─'*65}")
 
         if resume and os.path.exists(seg_cache_file) and os.path.getsize(seg_cache_file) > 1024:
-            print(f"  ⏭ [RESUME] Loading cached Stage 2 segment latent from: {seg_cache_file}")
-            completed_segment_packs.append(torch.load(seg_cache_file, map_location="cpu"))
+            print(f"  ⏭ [RESUME] Found cached Stage 2 segment latent: {seg_cache_file}")
+            completed_segment_paths.append(seg_cache_file)
             cur_lat_idx = end_lat_idx
             continue
 
@@ -1654,17 +1659,21 @@ def execute_segment_wise_diffusion_pipeline(
                 "valid_frames": valid_frames
             }
 
-            torch.save(seg_pack, seg_cache_file)
-            completed_segment_packs.append(seg_pack)
+            tmp_seg = seg_cache_file + ".tmp"
+            torch.save(seg_pack, tmp_seg)
+            os.replace(tmp_seg, seg_cache_file)
+            completed_segment_paths.append(seg_cache_file)
             print(f"  💾 Saved {seg_name} Latents to: {seg_cache_file}")
 
+            # RAM-SAFE: drop this segment's latents from RAM immediately; Phase C reloads lazily.
+            del seg_pack, final_seg_video_lat, a2_raw
             del model, video_vae, noise1, guider1, sigmas1, s1_out, v1_raw, noise2, guider2, sigmas2, s2_out, v2_raw
 
         cur_lat_idx = end_lat_idx
         LTXDirectorMemoryManager.purge(f"post_seg_{idx+1}")
 
     print("✅ All 5 Director Segments successfully sampled & upscaled!")
-    return completed_segment_packs
+    return completed_segment_paths
 
 print("✅ Cell 13 & 14: Segment-wise Diffusion & Upscale Engine ready.")
 
@@ -1672,69 +1681,111 @@ print("✅ Cell 13 & 14: Segment-wise Diffusion & Upscale Engine ready.")
 # ════════════════════════════════════════════════════════════════════════════
 # CELL 15: PHASE C - MEMORY-SAFE OUT-OF-CORE VAE DECODING
 # ════════════════════════════════════════════════════════════════════════════
+def _decode_one_video_latent(v_lat: Any, video_vae: Any) -> torch.Tensor:
+    """Decode a single segment latent, preferring the memory-safe tiled decoder."""
+    if "LTXVSpatioTemporalTiledVAEDecode" in NODE_CLASS_MAPPINGS:
+        try:
+            tiled_node = NODE_CLASS_MAPPINGS["LTXVSpatioTemporalTiledVAEDecode"]()
+            decoded_res = call_original_node(
+                "LTXVSpatioTemporalTiledVAEDecode",
+                node_instance=tiled_node,
+                vae=video_vae,
+                latents=v_lat,
+                spatial_tiles=2,
+                spatial_overlap=8,
+                temporal_tile_length=16,
+                temporal_overlap=4,
+                last_frame_fix=False,
+                working_device="auto",
+                working_dtype="auto"
+            )
+            return unwrap_tensor(decoded_res)
+        except Exception:
+            pass
+    vae_decode_node = NODE_CLASS_MAPPINGS["VAEDecode"]()
+    decoded_res = call_original_node("VAEDecode", node_instance=vae_decode_node, samples=v_lat, vae=video_vae)
+    return unwrap_tensor(decoded_res)
+
+
 def execute_phase_c_video_decode(
-    segment_packs: List[Dict[str, Any]],
+    segment_pack_paths: List[str],
     workdir: str = "/content/LTXDirector_Work",
-    resume: bool = True
+    resume: bool = True,
+    fps: int = 24,
+    crf: int = 8
 ) -> str:
-    frames_file = os.path.join(workdir, "decoded_video_frames.pt")
-    if resume and os.path.exists(frames_file) and os.path.getsize(frames_file) > 1024:
-        print(f"  ⏭ [RESUME] Loading cached decoded video frames from: {frames_file}")
-        return frames_file
+    """
+    RAM-SAFE streaming decode.
+
+    Previous behavior peaked at ~2x the full 30s frame tensor in host RAM
+    (list-accumulate -> torch.cat -> torch.save -> reload as float in Phase D),
+    which is the primary cause of the 12.2 GB OOM crash.
+
+    New behavior: decode ONE segment at a time and stream its frames straight
+    into a silent H.264 MP4 via an incremental FFMPEG writer. Peak host RAM is
+    now bounded by a single segment (converted to uint8 immediately), never the
+    whole video, and nothing large is ever persisted to a .pt.
+    """
+    import imageio
+
+    silent_video = os.path.join(workdir, "master_video_silent.mp4")
+    if resume and os.path.exists(silent_video) and os.path.getsize(silent_video) > 1024:
+        print(f"  ⏭ [RESUME] Found streamed silent video: {silent_video}")
+        return silent_video
 
     LTXDirectorMemoryManager.purge("pre_video_decode")
-    LTXDirectorMemoryManager.print_diagnostics(phase="PHASE C: Video VAE Decoding", node="VAEDecode")
+    LTXDirectorMemoryManager.print_diagnostics(phase="PHASE C: Video VAE Decoding (streaming)", node="VAEDecode")
 
+    tmp_video = silent_video + ".tmp.mp4"
+    writer = imageio.get_writer(
+        tmp_video,
+        format="FFMPEG",
+        mode="I",
+        fps=int(fps),
+        codec="libx264",
+        pixelformat="yuv420p",
+        output_params=["-crf", str(int(crf))],
+        macro_block_size=None,
+    )
+
+    total_written = 0
     with torch.inference_mode():
         video_vae = gv(call_original_node("VAELoader", vae_name="LTX23_video_vae_bf16.safetensors"), 0)
-        decoded_segment_frames = []
 
-        for idx, pack in enumerate(segment_packs):
+        for idx, seg_path in enumerate(segment_pack_paths):
+            print(f"  🎨 Decoding Segment {idx+1}/{len(segment_pack_paths)} frames via VAE...")
+            pack = torch.load(seg_path, map_location="cpu")
             v_lat = pack["video_latent"]
-            print(f"  🎨 Decoding Segment {idx+1}/{len(segment_packs)} frames via VAE...")
 
-            if "LTXVSpatioTemporalTiledVAEDecode" in NODE_CLASS_MAPPINGS:
-                try:
-                    tiled_node = NODE_CLASS_MAPPINGS["LTXVSpatioTemporalTiledVAEDecode"]()
-                    decoded_res = call_original_node(
-                        "LTXVSpatioTemporalTiledVAEDecode",
-                        node_instance=tiled_node,
-                        vae=video_vae,
-                        latents=v_lat,
-                        spatial_tiles=2,
-                        spatial_overlap=8,
-                        temporal_tile_length=16,
-                        temporal_overlap=4,
-                        last_frame_fix=False,
-                        working_device="auto",
-                        working_dtype="auto"
-                    )
-                    decoded_tensor = unwrap_tensor(decoded_res)
-                except Exception:
-                    vae_decode_node = NODE_CLASS_MAPPINGS["VAEDecode"]()
-                    decoded_res = call_original_node("VAEDecode", node_instance=vae_decode_node, samples=v_lat, vae=video_vae)
-                    decoded_tensor = unwrap_tensor(decoded_res)
-            else:
-                vae_decode_node = NODE_CLASS_MAPPINGS["VAEDecode"]()
-                decoded_res = call_original_node("VAEDecode", node_instance=vae_decode_node, samples=v_lat, vae=video_vae)
-                decoded_tensor = unwrap_tensor(decoded_res)
+            decoded_tensor = _decode_one_video_latent(v_lat, video_vae)
 
-            decoded_segment_frames.append(decoded_tensor.detach().cpu().half())
-            del decoded_tensor
+            # Convert to uint8 (on whichever device it lands) then pull to host as
+            # numpy. This avoids keeping a giant float32 CPU copy around.
+            frames_u8 = (
+                decoded_tensor.detach().clamp(0.0, 1.0).mul_(255.0)
+                .round().to(torch.uint8).cpu().numpy()
+            )
+            del decoded_tensor, pack, v_lat
+
+            n = frames_u8.shape[0]
+            for f in range(n):
+                writer.append_data(frames_u8[f])
+            total_written += n
+            print(f"    + streamed {n} frames (total {total_written})")
+
+            del frames_u8
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        full_video_frames = torch.cat(decoded_segment_frames, dim=0)
-        print(f"  ✓ Full 30s Master Frame Tensor Shape: {full_video_frames.shape}")
+        del video_vae
 
-        tmp_path = frames_file + ".tmp"
-        torch.save(full_video_frames, tmp_path)
-        os.replace(tmp_path, frames_file)
-        print(f"  💾 Decoded Video Frames saved: {frames_file}")
-
-        del video_vae, decoded_segment_frames, full_video_frames
+    writer.close()
+    os.replace(tmp_video, silent_video)
+    print(f"  💾 Streamed silent master video ({total_written} frames): {silent_video}")
 
     LTXDirectorMemoryManager.purge("video_decode_complete")
-    return frames_file
+    return silent_video
 
 print("✅ Cell 15: Video VAE Decoder configured.")
 
@@ -1743,7 +1794,7 @@ print("✅ Cell 15: Video VAE Decoder configured.")
 # CELL 16: PHASE C - AUDIO VAE DECODING & SYNCHRONIZATION
 # ════════════════════════════════════════════════════════════════════════════
 def execute_phase_c_audio_decode(
-    segment_packs: List[Dict[str, Any]],
+    segment_pack_paths: List[str],
     workdir: str = "/content/LTXDirector_Work",
     resume: bool = True
 ) -> str:
@@ -1759,12 +1810,25 @@ def execute_phase_c_audio_decode(
         audio_vae = gv(call_original_node("VAELoader", vae_name="LTX23_audio_vae_bf16.safetensors"), 0)
         audio_decode_node = NODE_CLASS_MAPPINGS["LTXVAudioVAEDecode"]()
 
-        aud_lat_list = [unwrap_latent(p["audio_latent"])["samples"] for p in segment_packs if unwrap_latent(p["audio_latent"])["samples"] is not None]
+        # RAM-SAFE: load each segment's (small) audio latent lazily from disk,
+        # keep only the audio tensor, and release the rest of the pack.
+        aud_lat_list = []
+        fallback_aud = None
+        for seg_path in segment_pack_paths:
+            pack = torch.load(seg_path, map_location="cpu")
+            if fallback_aud is None:
+                fallback_aud = pack.get("audio_latent")
+            samp = unwrap_latent(pack.get("audio_latent"))["samples"]
+            if samp is not None:
+                aud_lat_list.append(samp)
+            del pack
+
         if aud_lat_list:
             combined_aud_samples = concat_temporal_latents(aud_lat_list)
             combined_aud_lat = {"samples": combined_aud_samples}
         else:
-            combined_aud_lat = segment_packs[0]["audio_latent"]
+            combined_aud_lat = fallback_aud
+        del aud_lat_list
 
         print("  🎵 Decoding audio latent stream via LTXVAudioVAEDecode...")
         aud_res = call_original_node(
@@ -1794,6 +1858,41 @@ print("✅ Cell 16: Audio VAE Decoder configured.")
 # ════════════════════════════════════════════════════════════════════════════
 import numpy as np
 
+def _write_audio_dict_to_wav(audio_dict: Any, wav_path: str, default_sr: int = 48000) -> bool:
+    """Write a ComfyUI AUDIO dict ({'waveform': [B,C,N], 'sample_rate': int}) to WAV."""
+    try:
+        if audio_dict is None:
+            return False
+        wav = None
+        sr = default_sr
+        if isinstance(audio_dict, dict):
+            wav = audio_dict.get("waveform", None)
+            sr = int(audio_dict.get("sample_rate", default_sr))
+        elif isinstance(audio_dict, torch.Tensor):
+            wav = audio_dict
+        wav = unwrap_tensor(wav)
+        if not isinstance(wav, torch.Tensor):
+            return False
+        w = wav.detach().cpu().float()
+        while w.dim() > 2:          # [B, C, N] -> [C, N]
+            w = w[0]
+        if w.dim() == 1:            # [N] -> [1, N]
+            w = w.unsqueeze(0)
+        w = w.clamp(-1.0, 1.0)
+        try:
+            import torchaudio
+            torchaudio.save(wav_path, w, sr)
+            return True
+        except Exception:
+            from scipy.io import wavfile
+            arr = (w.transpose(0, 1).numpy() * 32767.0).astype(np.int16)  # [N, C]
+            wavfile.write(wav_path, sr, arr)
+            return True
+    except Exception as e:
+        print(f"  [Notice] Could not write decoded audio WAV: {e}")
+        return False
+
+
 def execute_phase_d_vhs_combine(
     frames_file_path: str,
     audio_file_path: str,
@@ -1801,67 +1900,56 @@ def execute_phase_d_vhs_combine(
     crf: int = 8,
     outdir: str = "/content/LTXStudio_Output"
 ) -> str:
+    """
+    RAM-SAFE final assembly.
+
+    `frames_file_path` is now the already-encoded SILENT MP4 produced by the
+    streaming Phase C decoder (not a giant frame tensor). We simply mux audio
+    onto it with a stream copy (`-c:v copy`), so no frames are ever loaded into
+    host RAM here.
+    """
     os.makedirs(outdir, exist_ok=True)
     final_output_path = os.path.join(outdir, "LTX23_Director_Master_30s.mp4")
+    silent_video = frames_file_path
 
-    LTXDirectorMemoryManager.purge("pre_vhs_combine")
-    LTXDirectorMemoryManager.print_diagnostics(phase="PHASE D: Final VHS Assembly", node="VHS_VideoCombine")
+    LTXDirectorMemoryManager.purge("pre_final_mux")
+    LTXDirectorMemoryManager.print_diagnostics(phase="PHASE D: Final Mux (stream-copy)", node="ffmpeg")
 
-    frames_tensor = torch.load(frames_file_path, map_location="cpu").float()
-    audio_dict = torch.load(audio_file_path, map_location="cpu") if os.path.exists(audio_file_path) else None
+    if not os.path.exists(silent_video) or os.path.getsize(silent_video) < 1024:
+        raise RuntimeError(f"Silent master video missing for mux: {silent_video}")
 
-    print(f"  🎬 Combining {frames_tensor.shape[0]} frames @ {fps} fps with synchronized audio...")
+    # 1) Preferred: mux the model-generated (lip-synced) audio decoded in Phase C.
+    audio_dict = torch.load(audio_file_path, map_location="cpu") if (audio_file_path and os.path.exists(audio_file_path)) else None
+    gen_wav = os.path.join(outdir, "generated_audio.wav")
+    have_gen_audio = _write_audio_dict_to_wav(audio_dict, gen_wav)
+    del audio_dict
+    gc.collect()
 
-    vhs_node = NODE_CLASS_MAPPINGS["VHS_VideoCombine"]()
-    vhs_params = {
-        "images": frames_tensor,
-        "audio": audio_dict,
-        "frame_rate": float(fps),
-        "loop_count": 0,
-        "filename_prefix": "LTX23_Director_Master",
-        "format": "video/h264-mp4",
-        "pix_fmt": "yuv420p",
-        "crf": int(crf),
-        "save_metadata": False,
-        "trim_to_audio": False,
-        "pingpong": False,
-        "save_output": True
-    }
+    muxed = False
+    if have_gen_audio:
+        print("  🎬 Muxing streamed video with generated (lip-synced) audio via stream-copy...")
+        cmd = (f'ffmpeg -y -i "{silent_video}" -i "{gen_wav}" '
+               f'-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 320k -shortest "{final_output_path}"')
+        if run_cmd(cmd, silent=False) == 0 and os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 1024:
+            muxed = True
 
-    video_combined = False
-    try:
-        res = call_original_node("VHS_VideoCombine", node_instance=vhs_node, **vhs_params)
-        if res and isinstance(res, (tuple, list)) and len(res) > 0:
-            filenames_dict = gv(res, 0)
-            if isinstance(filenames_dict, dict) and "ui" in filenames_dict and "gifs" in filenames_dict["ui"]:
-                generated_path = filenames_dict["ui"]["gifs"][0].get("fullpath", "")
-                if os.path.exists(generated_path):
-                    shutil.copyfile(generated_path, final_output_path)
-                    video_combined = True
-    except Exception as e:
-        print(f"  [Notice] Direct VHS node invocation fallback: {e}")
-
-    if not video_combined or not os.path.exists(final_output_path):
-        import imageio
-        raw_temp_mp4 = os.path.join(outdir, "temp_raw_video.mp4")
-        frames_np = (frames_tensor.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
-        imageio.mimwrite(raw_temp_mp4, frames_np, fps=fps, quality=9)
-
+    # 2) Fallback: mux the trimmed original backing track.
+    if not muxed:
         raw_song_path = "/content/ComfyUI/input/whatdreamscost/Late night trap.mp3"
         if os.path.exists(raw_song_path):
-            trim_sec = 446.9222739141953 / fps
-            dur_sec = frames_tensor.shape[0] / fps
-            cmd = (f'ffmpeg -y -i "{raw_temp_mp4}" -ss {trim_sec} -t {dur_sec} -i "{raw_song_path}" '
-                   f'-map 0:v:0 -map 1:a:0 -c:v libx264 -crf {crf} -pix_fmt yuv420p '
-                   f'-c:a aac -b:a 320k -shortest "{final_output_path}"')
-            run_cmd(cmd, silent=False)
-            if os.path.exists(raw_temp_mp4):
-                os.remove(raw_temp_mp4)
-        else:
-            shutil.move(raw_temp_mp4, final_output_path)
+            print("  🎬 [Fallback] Muxing streamed video with trimmed backing track...")
+            trim_sec = 446.9222739141953 / float(fps)
+            cmd = (f'ffmpeg -y -i "{silent_video}" -ss {trim_sec} -i "{raw_song_path}" '
+                   f'-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 320k -shortest "{final_output_path}"')
+            if run_cmd(cmd, silent=False) == 0 and os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 1024:
+                muxed = True
 
-    del frames_tensor, audio_dict
-    LTXDirectorMemoryManager.purge("vhs_cleanup")
+    # 3) Last resort: ship the silent video as the final output.
+    if not muxed:
+        print("  [Notice] No audio available; delivering silent master video.")
+        shutil.copyfile(silent_video, final_output_path)
+
+    LTXDirectorMemoryManager.purge("final_mux_cleanup")
     print(f"  🎉 Final Render Complete: {final_output_path}")
     return final_output_path
 
@@ -1947,28 +2035,36 @@ def run_ltx23_director_original_workflow(
     )
 
     # Phase B: Segment-Wise Diffusion (Stage 1 & 2 Latent Diffusion per Director Segment)
-    segment_packs = execute_segment_wise_diffusion_pipeline(
+    # Returns on-disk latent PATHS (not resident tensors) to keep host RAM flat.
+    segment_pack_paths = execute_segment_wise_diffusion_pipeline(
         director_state=director_state,
         seed=seed,
         workdir=workdir,
         resume=resume
     )
 
-    # Phase C: Video VAE Decoding -> Immediate Purge
+    # RAM-SAFE: Phase C/D read segment latents lazily from disk, so release the
+    # full Director latents + conditioning before decoding.
+    del director_state
+    LTXDirectorMemoryManager.purge("post_phase_b")
+
+    # Phase C: Video VAE Decoding -> streamed straight to a silent MP4
     frames_path = execute_phase_c_video_decode(
-        segment_packs=segment_packs,
+        segment_pack_paths=segment_pack_paths,
         workdir=workdir,
-        resume=resume
+        resume=resume,
+        fps=int(active_metadata["frame_rate"]),
+        crf=crf
     )
 
     # Phase C: Audio VAE Decoding -> Immediate Purge
     audio_path = execute_phase_c_audio_decode(
-        segment_packs=segment_packs,
+        segment_pack_paths=segment_pack_paths,
         workdir=workdir,
         resume=resume
     )
 
-    # Phase D: Final VHS Assembly
+    # Phase D: Final Mux (stream-copy, no frames in RAM)
     final_video = execute_phase_d_vhs_combine(
         frames_file_path=frames_path,
         audio_file_path=audio_path,
