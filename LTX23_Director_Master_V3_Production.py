@@ -651,7 +651,68 @@ class LTXDirectorMemoryManager:
         LTXDirectorMemoryManager.drop_os_page_cache()
         malloc_trim_os()
 
-print("✅ Cell 8: Fast GPU Memory Engine Active.")
+
+def ram_guard(min_free_gb: float = 2.0, tag: str = ""):
+    """Proactively deep-purge when host RAM runs low (ported from V2)."""
+    try:
+        import psutil
+        free = psutil.virtual_memory().available / 1e9
+    except Exception:
+        return
+    if free < min_free_gb:
+        print(f"⚠️ [RAM GUARD] Free RAM ({free:.2f} GB) < {min_free_gb} GB -> deep purge ({tag})")
+        LTXDirectorMemoryManager.purge(f"ram_guard:{tag}")
+
+
+def patch_comfy_memory_safety():
+    """Make ComfyUI's free_memory tolerant of None returns (ported from V2)."""
+    try:
+        import comfy.model_management as mm
+        if not getattr(mm, "_ltx_free_memory_safe", False):
+            _orig_free_memory = mm.free_memory
+            def _safe_free_memory(*args, **kwargs):
+                try:
+                    res = _orig_free_memory(*args, **kwargs)
+                    return res if isinstance(res, list) else []
+                except Exception:
+                    return []
+            mm.free_memory = _safe_free_memory
+            mm._ltx_free_memory_safe = True
+    except Exception as e:
+        print(f"  [Notice] memory-safety patch skipped: {e}")
+
+
+def patch_safetensors_direct_to_gpu():
+    """
+    Load text-encoder weights (Gemma/CLIP/projection) straight to CUDA to avoid a
+    multi-GB host-RAM copy during Phase A (ported from V2). Falls back to CPU on
+    any error so it can never break loading.
+    """
+    try:
+        import safetensors.torch as st
+        if not getattr(st, "_ltx_cuda_direct", False):
+            _orig_load = st.load_file
+            def _cuda_direct_load(filename, device="cpu"):
+                fn = str(filename).lower()
+                if torch.cuda.is_available() and any(
+                    k in fn for k in ["gemma", "clip", "text_encoder", "projection", "connector"]
+                ):
+                    try:
+                        return _orig_load(filename, device="cuda")
+                    except Exception:
+                        return _orig_load(filename, device=device)
+                return _orig_load(filename, device=device)
+            st.load_file = _cuda_direct_load
+            st._ltx_cuda_direct = True
+    except Exception:
+        pass
+
+
+# Apply the memory patches now so they cover Phase A text encoding.
+patch_comfy_memory_safety()
+patch_safetensors_direct_to_gpu()
+
+print("✅ Cell 8: Fast GPU Memory Engine Active (+ V2 RAM guard, safetensors→GPU, free_memory guard).")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1363,6 +1424,7 @@ def execute_phase_a_ltxdirector(
         return torch.load(state_file, map_location="cpu")
 
     LTXDirectorMemoryManager.purge("pre_phase_a")
+    ram_guard(min_free_gb=2.5, tag="phase_a_start")
     LTXDirectorMemoryManager.print_diagnostics(phase="PHASE A: LTXDirector Ingestion", node="LTXDirector")
 
     with torch.inference_mode():
@@ -1537,6 +1599,7 @@ def execute_segment_wise_diffusion_pipeline(
             continue
 
         LTXDirectorMemoryManager.purge(f"pre_seg_{idx+1}")
+        ram_guard(min_free_gb=2.5, tag=f"seg_{idx+1}_start")
 
         # Dimension-agnostic temporal slicing
         seg_vid_lat = {"samples": slice_temporal_latent(full_vid_tensor, cur_lat_idx, end_lat_idx)}
@@ -2048,6 +2111,8 @@ def run_ltx23_director_original_workflow(
     print("\n" + "="*70 + "\n🎬 STARTING LTX-2.3 DIRECTOR 2.0 WORKFLOW GENERATION\n" + "="*70)
 
     validate_original_nodes()
+    patch_comfy_memory_safety()
+    patch_safetensors_direct_to_gpu()
 
     active_metadata = dict(timeline_metadata)
     active_segments = list(segments)
