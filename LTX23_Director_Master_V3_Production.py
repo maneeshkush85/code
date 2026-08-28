@@ -171,6 +171,93 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🎛️  MASTER SETTINGS  (Colab form) — edit everything here
+# All downstream cells read from these variables. @param annotations render as
+# form widgets in Colab; in plain Python they are ordinary assignments.
+# ════════════════════════════════════════════════════════════════════════════
+# @markdown # 🎛️ Master Settings: Model, Resolution, LoRAs, Sampling & LTXDirector Timeline
+
+# @markdown ### 🧠 DiT Model (T4 VRAM sizing — see note)
+# @markdown Q3_K_S(~9.5GB, T4-safe) · Q3_K_M(~10.5GB) · Q4_K_S(~11.8GB) · Q4_K_M(~12.5GB, needs >15GB VRAM)
+dit_quant = "Q3_K_S"            # @param ["Q3_K_S", "Q3_K_M", "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0"]
+force_gpu_resident_dit = False  # @param {type:"boolean"}
+
+# @markdown ### 🖥️ Resolution & Output
+custom_width = 1280            # @param [768, 832, 960, 1024, 1152, 1280] {type:"raw"}
+custom_height = 720            # @param [432, 480, 544, 576, 640, 720] {type:"raw"}
+divisible_by = 32             # @param [8, 16, 32, 64] {type:"raw"}
+resize_method = "maintain aspect ratio"  # @param ["maintain aspect ratio", "stretch", "crop", "pad"]
+img_compression = 18          # @param {type:"slider", min:0, max:100, step:1}
+fps = 24                      # @param [24, 25, 30] {type:"raw"}
+output_crf = 8                # @param {type:"slider", min:0, max:30, step:1}
+
+# @markdown ### 🎲 Runtime
+base_seed = 2026              # @param {type:"integer"}
+seed_mode = "fixed"           # @param ["fixed", "random"]
+resume_checkpoints = True     # @param {type:"boolean"}
+debug_mode = False            # @param {type:"boolean"}
+debug_max_frames = 120        # @param {type:"slider", min:24, max:756, step:8}
+min_ram_guard_gb = 2.5        # @param {type:"slider", min:1.0, max:6.0, step:0.5}
+
+# @markdown ### 🎛️ Director 2.0 — 4-LoRA Stack
+use_lora_1 = True             # @param {type:"boolean"}
+lora_strength_1 = 0.4         # @param {type:"slider", min:0.0, max:1.5, step:0.05}
+use_lora_2 = True             # @param {type:"boolean"}
+lora_strength_2 = 0.6         # @param {type:"slider", min:0.0, max:1.5, step:0.05}
+use_lora_3 = True             # @param {type:"boolean"}
+lora_strength_3 = 0.7         # @param {type:"slider", min:0.0, max:1.5, step:0.05}
+use_lora_4 = True             # @param {type:"boolean"}
+lora_strength_4 = 0.9         # @param {type:"slider", min:0.0, max:1.5, step:0.05}
+lora_name_1 = "ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors"  # @param {type:"string"}
+lora_name_2 = "LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors"                                # @param {type:"string"}
+lora_name_3 = "ltx2.3-transition.safetensors"                                           # @param {type:"string"}
+lora_name_4 = "LTX2.3-MVCamera-drclips.safetensors"                                     # @param {type:"string"}
+
+# @markdown ### ⚙️ Two-Stage Sampling
+sampler_name = "euler"          # @param ["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_sde", "ddim", "lcm"]
+scheduler_name = "linear_quadratic"  # @param ["linear_quadratic", "normal", "karras", "simple", "sgm_uniform", "beta"]
+sampler_cfg = 1.0               # @param {type:"slider", min:1.0, max:8.0, step:0.1}
+stage1_steps = 8                # @param {type:"slider", min:2, max:30, step:1}
+stage1_denoise = 1.0            # @param {type:"slider", min:0.1, max:1.0, step:0.01}
+stage1_guide_strength = 0.5     # @param {type:"slider", min:0.0, max:1.0, step:0.05}
+stage2_steps = 4                # @param {type:"slider", min:1, max:20, step:1}
+stage2_denoise = 0.42           # @param {type:"slider", min:0.05, max:1.0, step:0.01}
+stage2_guide_strength = 1.0     # @param {type:"slider", min:0.0, max:1.0, step:0.05}
+guide_frame = 1                 # @param {type:"integer"}
+guide_interpolation = "bicubic" # @param ["bicubic", "bilinear", "nearest", "area"]
+guide_crop_position = "center"  # @param ["center", "top", "bottom", "left", "right"]
+
+# @markdown ### 🎬 LTXDirector Timeline
+duration_seconds = 31.5         # @param {type:"number"}
+total_frames = 756              # @param {type:"integer"}
+timeline_start_frame = 0        # @param {type:"integer"}
+timeline_epsilon = 0.001        # @param {type:"number"}
+main_track_enabled = True       # @param {type:"boolean"}
+audio_track_enabled = True      # @param {type:"boolean"}
+motion_track_enabled = True     # @param {type:"boolean"}
+# @markdown Comma-separated per-segment values (5 segments):
+segment_lengths = "226.01059340956584,161.31859976617454,131.45629831196658,225.5063328766255,83.22765271847516"  # @param {type:"string"}
+guide_strength = "1.00,1.00,1.00,1.00,1.00"  # @param {type:"string"}
+# @markdown Per-segment keyframe images (relative to ComfyUI/input):
+seg1_image = "whatdreamscost/1.png"    # @param {type:"string"}
+seg2_image = "whatdreamscost/2.png"    # @param {type:"string"}
+seg3_image = "whatdreamscost/3.png"    # @param {type:"string"}
+seg4_image = "whatdreamscost/4.png"    # @param {type:"string"}
+seg5_image = "whatdreamscost/5.3.png"  # @param {type:"string"}
+
+# @markdown ### 🎵 Audio Track
+audio_file = "whatdreamscost/Late night trap.mp3"  # @param {type:"string"}
+audio_trim_start_frames = 446.9222739141953        # @param {type:"number"}
+audio_duration_frames = 2880                        # @param {type:"integer"}
+inpaint_audio = True            # @param {type:"boolean"}
+override_audio = False          # @param {type:"boolean"}
+use_custom_audio = True         # @param {type:"boolean"}
+use_custom_motion = True        # @param {type:"boolean"}
+
+print(f"🎛️ Master Settings loaded (quant={dit_quant} | {custom_width}x{custom_height} @ {fps}fps | {total_frames} frames).")
+
 def download_file(url: str, dest_dir: str, filename: Optional[str] = None) -> Optional[str]:
     try:
         Path(dest_dir).mkdir(parents=True, exist_ok=True)
@@ -210,17 +297,15 @@ def link_file_safe(src_path: str, dst_path: str):
 # does not, ComfyUI pages weights to host RAM to make sampling fit, and the
 # 12.2 GB Colab box gets OOM-killed mid-sampling (silent crash, no CUDA error).
 # Approx dev-quant sizes on a 15 GB T4 (weights | activation headroom left):
-#   Q4_K_M ≈ 12.5 GB | ~3 GB  -> forces CPU offload -> HOST-RAM OOM  (your crash)
+#   Q4_K_M ≈ 12.5 GB | ~3 GB  -> forces CPU offload -> HOST-RAM OOM
 #   Q4_K_S ≈ 11.8 GB | ~4 GB  -> still risky
 #   Q3_K_M ≈ 10.5 GB | ~5 GB  -> borderline OK
 #   Q3_K_S ≈  9.5 GB | ~6 GB  -> RECOMMENDED for T4 free tier
-# Raise this only on a bigger GPU (L4/A100). Smallest available dev quant is Q3_K_S.
-DIT_QUANT = os.environ.get("LTX_DIT_QUANT", "Q3_K_S")
+# Set via the `dit_quant` / `force_gpu_resident_dit` fields in Master Settings.
+DIT_QUANT = os.environ.get("LTX_DIT_QUANT", dit_quant)
 DIT_GGUF_FILENAME = f"ltx-2-3-22b-dev-{DIT_QUANT}.gguf"
 DIT_GGUF_URL = f"https://huggingface.co/vantagewithai/LTX-2.3-GGUF/resolve/main/dev/{DIT_GGUF_FILENAME}"
-# Pin the DiT fully-resident on GPU (skip ComfyUI's smart CPU offload). Safe only
-# once the model fits VRAM with headroom; harmless with the Q3_K_S default.
-FORCE_GPU_RESIDENT_DIT = os.environ.get("LTX_FORCE_GPU_RESIDENT", "0") == "1"
+FORCE_GPU_RESIDENT_DIT = force_gpu_resident_dit or (os.environ.get("LTX_FORCE_GPU_RESIDENT", "0") == "1")
 
 print(f"📦 Downloading LTX-2.3 Core Models... (DiT quant: {DIT_QUANT})")
 
@@ -409,76 +494,64 @@ Positive Prompt, in my hub."
 
 NEGATIVE_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走, robotic movement, static presenter, jitter, flicker, facial distortion, extra limbs, watermark"
 
+# ─── Build the timeline + segments from the Master Settings above ────────────
+_seg_lengths = [float(x) for x in str(segment_lengths).split(",") if str(x).strip() != ""]
+_seg_images = [seg1_image, seg2_image, seg3_image, seg4_image, seg5_image][:len(_seg_lengths)]
+_seg_ids = [
+    "1785555235678s2fn3", "17855552413529uw9r", "1785555243885y3h85",
+    "1785555247117rcoma", "17855554543736wlrg",
+]
+# Derive a base stage-1 (pre-upscale) resolution from the target, rounded to divisible_by.
+def _round_to(v, m):
+    return max(int(m), int(round(v / m)) * int(m))
+_gen_w = _round_to(custom_width * 0.65, divisible_by)   # ~832 from 1280
+_gen_h = _round_to(custom_height * 0.667, divisible_by)  # ~480 from 720
+
 TIMELINE_METADATA = {
-    "frame_rate": 24.0,
-    "duration_seconds": 31.5,
-    "normalDurationFrames": 756,
-    "start_frame": 0,
-    "end_frame": 756,
-    "custom_width": 1280,
-    "custom_height": 720,
-    "generation_width": 832,
-    "generation_height": 480,
-    "base_stage1_width": 416,
-    "base_stage1_height": 240,
-    "mainTrackEnabled": True,
-    "audioTrackEnabled": True,
-    "motionTrackEnabled": True,
-    "inpaint_audio": True,
-    "override_audio": False,
-    "use_custom_audio": True,
-    "use_custom_motion": True,
-    "audio_file": "whatdreamscost/Late night trap.mp3",
-    "audio_duration_frames": 2880,
-    "audio_trim_start_frames": 446.9222739141953,
-    "guide_strength": "1.00,1.00,1.00,1.00,1.00",
-    "segment_lengths": "226.01059340956584,161.31859976617454,131.45629831196658,225.5063328766255,83.22765271847516"
+    "frame_rate": float(fps),
+    "duration_seconds": float(duration_seconds),
+    "normalDurationFrames": int(total_frames),
+    "start_frame": int(timeline_start_frame),
+    "end_frame": int(total_frames),
+    "custom_width": int(custom_width),
+    "custom_height": int(custom_height),
+    "generation_width": _gen_w,
+    "generation_height": _gen_h,
+    "base_stage1_width": _round_to(_gen_w / 2, divisible_by),
+    "base_stage1_height": _round_to(_gen_h / 2, divisible_by),
+    "divisible_by": int(divisible_by),
+    "resize_method": resize_method,
+    "img_compression": int(img_compression),
+    "mainTrackEnabled": bool(main_track_enabled),
+    "audioTrackEnabled": bool(audio_track_enabled),
+    "motionTrackEnabled": bool(motion_track_enabled),
+    "inpaint_audio": bool(inpaint_audio),
+    "override_audio": bool(override_audio),
+    "use_custom_audio": bool(use_custom_audio),
+    "use_custom_motion": bool(use_custom_motion),
+    "audio_file": audio_file,
+    "audio_duration_frames": int(audio_duration_frames),
+    "audio_trim_start_frames": float(audio_trim_start_frames),
+    "guide_strength": str(guide_strength),
+    "segment_lengths": str(segment_lengths),
+    "epsilon": float(timeline_epsilon),
 }
 
-ORIGINAL_SEGMENTS = [
-    {
-        "id": "1785555235678s2fn3",
-        "start": 0.0,
-        "length": 226.01059340956584,
+ORIGINAL_SEGMENTS = []
+_cum = 0.0
+for _i, _len in enumerate(_seg_lengths):
+    ORIGINAL_SEGMENTS.append({
+        "id": _seg_ids[_i] if _i < len(_seg_ids) else f"seg_{_i+1}",
+        "start": _cum,
+        "length": float(_len),
         "prompt": "",
         "type": "image",
-        "imageFile": "whatdreamscost/1.png"
-    },
-    {
-        "id": "17855552413529uw9r",
-        "start": 226.01059340956584,
-        "length": 161.31859976617454,
-        "prompt": "",
-        "type": "image",
-        "imageFile": "whatdreamscost/2.png"
-    },
-    {
-        "id": "1785555243885y3h85",
-        "start": 387.3291931757404,
-        "length": 131.45629831196658,
-        "prompt": "",
-        "type": "image",
-        "imageFile": "whatdreamscost/3.png"
-    },
-    {
-        "id": "1785555247117rcoma",
-        "start": 518.785491487707,
-        "length": 225.5063328766255,
-        "prompt": "",
-        "type": "image",
-        "imageFile": "whatdreamscost/4.png"
-    },
-    {
-        "id": "17855554543736wlrg",
-        "start": 744.2918243643325,
-        "length": 83.22765271847516,
-        "prompt": "",
-        "type": "image",
-        "imageFile": "whatdreamscost/5.3.png"
-    }
-]
+        "imageFile": _seg_images[_i] if _i < len(_seg_images) else f"whatdreamscost/{_i+1}.png",
+    })
+    _cum += float(_len)
 
-print("✅ Cell 6: Authoritative Timeline & Global Prompt loaded.")
+print(f"✅ Cell 6: Timeline built from settings ({len(ORIGINAL_SEGMENTS)} segments | "
+      f"gen {_gen_w}x{_gen_h} -> {custom_width}x{custom_height}).")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -820,14 +893,14 @@ class DirectorTimelineController:
             "display_mode": "seconds",
             "custom_width": int(self.meta["custom_width"]),
             "custom_height": int(self.meta["custom_height"]),
-            "resize_method": "maintain aspect ratio",
-            "divisible_by": 32,
-            "img_compression": 18,
+            "resize_method": self.meta.get("resize_method", "maintain aspect ratio"),
+            "divisible_by": int(self.meta.get("divisible_by", 32)),
+            "img_compression": int(self.meta.get("img_compression", 18)),
             "guide_strength": str(self.meta["guide_strength"]),
             "local_prompts": " |  |  |  | ",
             "segment_lengths": str(self.meta["segment_lengths"]),
             "timeline_data": tl_json_str,
-            "epsilon": 0.001,
+            "epsilon": float(self.meta.get("epsilon", 0.001)),
             "start_second": 0.0,
             "end_second": float(self.meta["duration_seconds"]),
             "duration_seconds": float(self.meta["duration_seconds"]),
@@ -854,18 +927,18 @@ class DirectorTimelineController:
             tl_json_str,
             " |  |  |  | ",
             str(self.meta["segment_lengths"]),
-            0.001,
+            float(self.meta.get("epsilon", 0.001)),
             str(self.meta["guide_strength"]),
-            True,
-            True,
-            True,
+            bool(self.meta["mainTrackEnabled"]),
+            bool(self.meta["audioTrackEnabled"]),
+            bool(self.meta["motionTrackEnabled"]),
             float(self.meta["frame_rate"]),
             "seconds",
             int(self.meta["custom_width"]),
             int(self.meta["custom_height"]),
-            "maintain aspect ratio",
-            32,
-            18,
+            self.meta.get("resize_method", "maintain aspect ratio"),
+            int(self.meta.get("divisible_by", 32)),
+            int(self.meta.get("img_compression", 18)),
             False,
             ""
         ]
@@ -1327,45 +1400,32 @@ def load_dit_and_loras():
     model = gv(call_original_node("UnetLoaderGGUF", unet_name=DIT_GGUF_FILENAME), 0)
     print(f"  ✓ UnetLoaderGGUF loaded ({DIT_GGUF_FILENAME}).")
 
+    # Build the LoRA stack from Master Settings (toggles / strengths / names).
+    _lora_settings = [
+        (use_lora_1, lora_name_1, lora_strength_1),
+        (use_lora_2, lora_name_2, lora_strength_2),
+        (use_lora_3, lora_name_3, lora_strength_3),
+        (use_lora_4, lora_name_4, lora_strength_4),
+    ]
     power_lora_node = NODE_CLASS_MAPPINGS["Power Lora Loader (rgthree)"]()
-    lora_stack_params = {
-        "model": model,
-        "clip": None,
-        "lora_1": {
-            "on": True,
-            "lora": "ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors",
-            "strength": 0.4
-        },
-        "lora_2": {
-            "on": True,
-            "lora": "LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors",
-            "strength": 0.6
-        },
-        "lora_3": {
-            "on": True,
-            "lora": "ltx2.3-transition.safetensors",
-            "strength": 0.7
-        },
-        "lora_4": {
-            "on": True,
-            "lora": "LTX2.3-MVCamera-drclips.safetensors",
-            "strength": 0.9
-        }
-    }
+    lora_stack_params = {"model": model, "clip": None}
+    _active = 0
+    for _n, (_on, _name, _str) in enumerate(_lora_settings, start=1):
+        lora_stack_params[f"lora_{_n}"] = {"on": bool(_on), "lora": _name, "strength": float(_str)}
+        if _on:
+            _active += 1
 
     try:
         res = call_original_node("Power Lora Loader (rgthree)", node_instance=power_lora_node, **lora_stack_params)
         model = gv(res, 0) or model
-        print("  ✓ Power Lora Loader (rgthree) applied 4-LoRA stack to DiT.")
+        print(f"  ✓ Power Lora Loader (rgthree) applied {_active}-LoRA stack to DiT.")
     except Exception as e:
         print(f"  [Notice] PowerLora fallback: {e}")
         from nodes import LoraLoaderModelOnly
-        for lora_cfg in [
-            ("ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors", 0.4),
-            ("LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors", 0.6),
-            ("ltx2.3-transition.safetensors", 0.7),
-            ("LTX2.3-MVCamera-drclips.safetensors", 0.9),
-        ]:
+        for _on, _name, _str in _lora_settings:
+            if not _on:
+                continue
+            lora_cfg = (_name, float(_str))
             if os.path.exists(os.path.join("/content/ComfyUI/models/loras", lora_cfg[0])):
                 ll = LoraLoaderModelOnly()
                 model = gv(ll.load_lora_model_only(model=model, lora_name=lora_cfg[0], strength_model=lora_cfg[1]), 0)
@@ -1424,7 +1484,7 @@ def execute_phase_a_ltxdirector(
         return torch.load(state_file, map_location="cpu")
 
     LTXDirectorMemoryManager.purge("pre_phase_a")
-    ram_guard(min_free_gb=2.5, tag="phase_a_start")
+    ram_guard(min_free_gb=min_ram_guard_gb, tag="phase_a_start")
     LTXDirectorMemoryManager.print_diagnostics(phase="PHASE A: LTXDirector Ingestion", node="LTXDirector")
 
     with torch.inference_mode():
@@ -1599,7 +1659,7 @@ def execute_segment_wise_diffusion_pipeline(
             continue
 
         LTXDirectorMemoryManager.purge(f"pre_seg_{idx+1}")
-        ram_guard(min_free_gb=2.5, tag=f"seg_{idx+1}_start")
+        ram_guard(min_free_gb=min_ram_guard_gb, tag=f"seg_{idx+1}_start")
 
         # Dimension-agnostic temporal slicing
         seg_vid_lat = {"samples": slice_temporal_latent(full_vid_tensor, cur_lat_idx, end_lat_idx)}
@@ -1621,11 +1681,11 @@ def execute_segment_wise_diffusion_pipeline(
                 "guide_data": director_state["guide_data"],
                 "motion_guide_data": director_state["motion_guide_data"],
                 "model": model,
-                "strength": 0.5,
+                "strength": float(stage1_guide_strength),
                 "rescale_method": "None",
-                "guide_frame": 1,
-                "interpolation": "bicubic",
-                "crop_position": "center",
+                "guide_frame": int(guide_frame),
+                "interpolation": guide_interpolation,
+                "crop_position": guide_crop_position,
                 "enable_guide": True
             }
             guide1_res = call_original_node("LTXDirectorGuide", node_instance=guide1_node, **guide1_params)
@@ -1649,22 +1709,22 @@ def execute_segment_wise_diffusion_pipeline(
             noise1 = gv(call_original_node("RandomNoise", node_instance=noise_node, noise_seed=seed + idx * 100), 0)
 
             guider_node = NODE_CLASS_MAPPINGS["CFGGuider"]()
-            guider1 = gv(call_original_node("CFGGuider", node_instance=guider_node, cfg=1.0, model=s1_model, positive=s1_pos, negative=s1_neg), 0)
+            guider1 = gv(call_original_node("CFGGuider", node_instance=guider_node, cfg=float(sampler_cfg), model=s1_model, positive=s1_pos, negative=s1_neg), 0)
 
             sampler_select_node = NODE_CLASS_MAPPINGS["KSamplerSelect"]()
-            sampler_euler = gv(call_original_node("KSamplerSelect", node_instance=sampler_select_node, sampler_name="euler"), 0)
+            sampler_euler = gv(call_original_node("KSamplerSelect", node_instance=sampler_select_node, sampler_name=sampler_name), 0)
 
             scheduler_node = NODE_CLASS_MAPPINGS["BasicScheduler"]()
             sigmas1 = gv(call_original_node(
                 "BasicScheduler",
                 node_instance=scheduler_node,
                 model=s1_model,
-                scheduler="linear_quadratic",
-                steps=8,
-                denoise=1.0
+                scheduler=scheduler_name,
+                steps=int(stage1_steps),
+                denoise=float(stage1_denoise)
             ), 0)
 
-            print(f"  ⚡ Sampling Stage 1 for {seg_name} (8 steps)...")
+            print(f"  ⚡ Sampling Stage 1 for {seg_name} ({int(stage1_steps)} steps)...")
             t_s1 = time.time()
             sampler_custom_node = NODE_CLASS_MAPPINGS["SamplerCustomAdvanced"]()
             s1_out = call_original_node(
@@ -1715,11 +1775,11 @@ def execute_segment_wise_diffusion_pipeline(
                 "guide_data": director_state["guide_data"],
                 "motion_guide_data": director_state["motion_guide_data"],
                 "model": model,
-                "strength": 1.0,
+                "strength": float(stage2_guide_strength),
                 "rescale_method": "None",
-                "guide_frame": 1,
-                "interpolation": "bicubic",
-                "crop_position": "center",
+                "guide_frame": int(guide_frame),
+                "interpolation": guide_interpolation,
+                "crop_position": guide_crop_position,
                 "enable_guide": True
             }
             guide2_res = call_original_node("LTXDirectorGuide", node_instance=guide2_node, **guide2_params)
@@ -1736,10 +1796,10 @@ def execute_segment_wise_diffusion_pipeline(
             ), 0), "cpu")
 
             noise2 = gv(call_original_node("RandomNoise", node_instance=noise_node, noise_seed=seed + idx * 100), 0)
-            guider2 = gv(call_original_node("CFGGuider", node_instance=guider_node, cfg=1.0, model=s2_model, positive=s2_pos, negative=s2_neg), 0)
-            sigmas2 = gv(call_original_node("BasicScheduler", node_instance=scheduler_node, model=s2_model, scheduler="linear_quadratic", steps=4, denoise=0.42), 0)
+            guider2 = gv(call_original_node("CFGGuider", node_instance=guider_node, cfg=float(sampler_cfg), model=s2_model, positive=s2_pos, negative=s2_neg), 0)
+            sigmas2 = gv(call_original_node("BasicScheduler", node_instance=scheduler_node, model=s2_model, scheduler=scheduler_name, steps=int(stage2_steps), denoise=float(stage2_denoise)), 0)
 
-            print(f"  ⚡ Stage 2 Refinement for {seg_name} (4 steps)...")
+            print(f"  ⚡ Stage 2 Refinement for {seg_name} ({int(stage2_steps)} steps)...")
             t_s2 = time.time()
             s2_out = call_original_node("SamplerCustomAdvanced", node_instance=sampler_custom_node, noise=noise2, guider=guider2, sampler=sampler_euler, sigmas=sigmas2, latent_image=av2_in)
             s2_lat = sync_latent_device(gv(s2_out, 0), "cpu")
@@ -2078,17 +2138,21 @@ print("✅ Cell 18: Artifact Verifier ready.")
 # ════════════════════════════════════════════════════════════════════════════
 # CELL 19: RUNTIME CONFIGURATION & QUALITY DEBUG MODE
 # ════════════════════════════════════════════════════════════════════════════
-DEBUG_MODE = False
-DEBUG_MAX_FRAMES = 120
-BASE_SEED = 2026
-SEED_MODE = "fixed"
-RESUME_CHECKPOINTS = True
-OUTPUT_CRF = 8
+# All runtime knobs come from the Master Settings cell.
+DEBUG_MODE = bool(debug_mode)
+DEBUG_MAX_FRAMES = int(debug_max_frames)
+if str(seed_mode).lower() == "random":
+    BASE_SEED = int.from_bytes(os.urandom(4), "big")
+else:
+    BASE_SEED = int(base_seed)
+SEED_MODE = seed_mode
+RESUME_CHECKPOINTS = bool(resume_checkpoints)
+OUTPUT_CRF = int(output_crf)
 
 WORK_DIRECTORY = "/content/LTXDirector_Work"
 OUTPUT_DIRECTORY = "/content/LTXStudio_Output"
 
-print(f"✅ Cell 19: Runtime Configured (Debug Mode: {DEBUG_MODE} | Seed: {BASE_SEED})")
+print(f"✅ Cell 19: Runtime Configured (Debug: {DEBUG_MODE} | Seed: {BASE_SEED} [{SEED_MODE}] | CRF: {OUTPUT_CRF} | Resume: {RESUME_CHECKPOINTS})")
 
 
 # ════════════════════════════════════════════════════════════════════════════
