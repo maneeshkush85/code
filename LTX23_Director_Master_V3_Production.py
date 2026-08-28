@@ -55,7 +55,7 @@ if not os.path.exists("/content/swapfile") or os.path.getsize("/content/swapfile
     print("⚙️ [1/3] Setting up Contiguous 16GB Swap Partition...")
     run_cmd("swapoff /content/swapfile || true")
     run_cmd("rm -f /content/swapfile")
-    run_cmd("dd if=/dev/zero of=/content/swapfile bs=1M count=16384 status=none || fallocate -l 16G /content/swapfile")
+    run_cmd("fallocate -l 16G /content/swapfile || dd if=/dev/zero of=/content/swapfile bs=1M count=16384 status=none")
     run_cmd("chmod 600 /content/swapfile")
     run_cmd("mkswap /content/swapfile")
     run_cmd("swapon /content/swapfile || true")
@@ -67,6 +67,10 @@ try:
     sw = psutil.swap_memory()
     vm = psutil.virtual_memory()
     print(f"  📊 Memory Status: Host RAM: {vm.available/1e9:.2f} GB available ({vm.total/1e9:.2f} GB total) | Swap: {sw.total/1e9:.2f} GB")
+    if sw.total < (1 * 1024 * 1024 * 1024):
+        print("  ⚠️  WARNING: swap is NOT active (Colab usually blocks `swapon`). The host-RAM")
+        print("     safety buffer is gone, so an oversized DiT quant WILL hard-crash the session.")
+        print("     Keep DIT_QUANT at Q3_K_S/Q3_K_M so the model fits VRAM without offloading to RAM.")
 except Exception:
     pass
 
@@ -201,14 +205,31 @@ def link_file_safe(src_path: str, dst_path: str):
         except Exception:
             pass
 
-print("📦 Downloading LTX-2.3 Core Models...")
+# ─── T4 FREE-TIER DiT SIZING (root cause of the mid-sampling "session crashed") ─
+# The 22B DiT must fit in VRAM *with* room for the video activation pool. If it
+# does not, ComfyUI pages weights to host RAM to make sampling fit, and the
+# 12.2 GB Colab box gets OOM-killed mid-sampling (silent crash, no CUDA error).
+# Approx dev-quant sizes on a 15 GB T4 (weights | activation headroom left):
+#   Q4_K_M ≈ 12.5 GB | ~3 GB  -> forces CPU offload -> HOST-RAM OOM  (your crash)
+#   Q4_K_S ≈ 11.8 GB | ~4 GB  -> still risky
+#   Q3_K_M ≈ 10.5 GB | ~5 GB  -> borderline OK
+#   Q3_K_S ≈  9.5 GB | ~6 GB  -> RECOMMENDED for T4 free tier
+# Raise this only on a bigger GPU (L4/A100). Smallest available dev quant is Q3_K_S.
+DIT_QUANT = os.environ.get("LTX_DIT_QUANT", "Q3_K_S")
+DIT_GGUF_FILENAME = f"ltx-2-3-22b-dev-{DIT_QUANT}.gguf"
+DIT_GGUF_URL = f"https://huggingface.co/vantagewithai/LTX-2.3-GGUF/resolve/main/dev/{DIT_GGUF_FILENAME}"
+# Pin the DiT fully-resident on GPU (skip ComfyUI's smart CPU offload). Safe only
+# once the model fits VRAM with headroom; harmless with the Q3_K_S default.
+FORCE_GPU_RESIDENT_DIT = os.environ.get("LTX_FORCE_GPU_RESIDENT", "0") == "1"
+
+print(f"📦 Downloading LTX-2.3 Core Models... (DiT quant: {DIT_QUANT})")
 
 dit_model = download_file(
-    "https://huggingface.co/vantagewithai/LTX-2.3-GGUF/resolve/main/dev/ltx-2-3-22b-dev-Q4_K_M.gguf",
+    DIT_GGUF_URL,
     "/content/ComfyUI/models/unet",
-    filename="ltx-2-3-22b-dev-Q4_K_M.gguf"
+    filename=DIT_GGUF_FILENAME
 )
-link_file_safe("/content/ComfyUI/models/unet/ltx-2-3-22b-dev-Q4_K_M.gguf", "/content/ComfyUI/models/diffusion_models/ltx-2-3-22b-dev-Q4_K_M.gguf")
+link_file_safe(f"/content/ComfyUI/models/unet/{DIT_GGUF_FILENAME}", f"/content/ComfyUI/models/diffusion_models/{DIT_GGUF_FILENAME}")
 
 text_encoder_model = download_file(
     "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors",
@@ -1242,8 +1263,8 @@ def load_clip_and_encode_to_gpu(prompt_text: str) -> Tuple[Any, Any]:
 
 def load_dit_and_loras():
     LTXDirectorMemoryManager.print_diagnostics(phase="DiT Loading", node="UnetLoaderGGUF")
-    model = gv(call_original_node("UnetLoaderGGUF", unet_name="ltx-2-3-22b-dev-Q4_K_M.gguf"), 0)
-    print("  ✓ UnetLoaderGGUF loaded.")
+    model = gv(call_original_node("UnetLoaderGGUF", unet_name=DIT_GGUF_FILENAME), 0)
+    print(f"  ✓ UnetLoaderGGUF loaded ({DIT_GGUF_FILENAME}).")
 
     power_lora_node = NODE_CLASS_MAPPINGS["Power Lora Loader (rgthree)"]()
     lora_stack_params = {
@@ -1304,6 +1325,22 @@ def load_dit_and_loras():
             print("  ✓ ChunkFeedForward Hook Applied (chunks=8).")
         except Exception:
             pass
+
+    # Optionally pin the DiT fully-resident on GPU so ComfyUI never pages the
+    # 22B weights through host RAM (the mid-sampling OOM path). Only enable when
+    # the chosen quant fits VRAM with headroom (see DIT_QUANT notes).
+    if FORCE_GPU_RESIDENT_DIT:
+        try:
+            import comfy.model_management as mm
+            if hasattr(mm, "VRAMState") and hasattr(mm, "vram_state"):
+                mm.vram_state = mm.VRAMState.HIGH_VRAM
+            try:
+                mm.load_models_gpu([model], force_full_load=True)
+            except TypeError:
+                mm.load_models_gpu([model])
+            print("  ✓ DiT pinned fully-resident on GPU (host-RAM offload disabled).")
+        except Exception as e:
+            print(f"  [Notice] Could not pin DiT to GPU (continuing with smart offload): {e}")
 
     return model
 
