@@ -889,7 +889,18 @@ def build_validator(graph: Dict[str, Any]):
                                        a.get("audio_duration_frames")))
         rep.check("Audio", audio_ok, "; ".join(audio_detail))
 
-        # --- Stage 1 (base sampling: nodes 33/32/28/133/31/30) -------------
+        # --- Stage 1 = BASE PASS (nodes 33/32/28/133/31/30) ----------------
+        # TOPOLOGY (source of truth = the JSON; do NOT reorder to match prose):
+        #   base stage node ids: BasicScheduler 33 = [linear_quadratic, 8, 1.0]
+        #   (8 steps, denoise 1.0), KSamplerSelect 32 = euler, CFGGuider 28 = 1,
+        #   LTXDirectorGuide 133 @ guide strength 0.5, SamplerCustomAdvanced 31.
+        # NAMING NOTE (review issue 3): the task description lists guide
+        # strengths "1.0 and 0.5" in that reading order, but the JSON wires the
+        # LOWER strength 0.5 (node 133) onto this 8-step base pass. So
+        # "Stage 1" == node 133 @ 0.5, NOT the "1.0" a reader might expect. This
+        # label is cosmetic; the executor follows the parsed links, so the
+        # node-id -> value bindings (guide 0.5 on 133, denoise 1.0 on 33) are
+        # reproduced exactly regardless of the human label.
         stage1_ok = True
         stage1_detail = []
         if _wv(33) != EXPECTED_SCHEDULERS[33]:
@@ -914,7 +925,16 @@ def build_validator(graph: Dict[str, Any]):
                                  % (EXPECTED_RANDOMNOISE_30, _wv(30)))
         rep.check("Stage 1", stage1_ok, "; ".join(stage1_detail))
 
-        # --- Stage 2 (upscale sampling: nodes 21/20/17/132/19/27/10) -------
+        # --- Stage 2 = UPSCALE PASS (nodes 21/20/17/132/19/27/10) ----------
+        # TOPOLOGY (source of truth = the JSON; do NOT reorder to match prose):
+        #   upscale stage node ids: BasicScheduler 21 = [linear_quadratic, 4,
+        #   0.42] (4 steps, denoise 0.42), KSamplerSelect 20 = euler,
+        #   CFGGuider 17 = 1, LTXDirectorGuide 132 @ guide strength 1.0,
+        #   SamplerCustomAdvanced 19 (fed by LTXVLatentUpsampler 14).
+        # NAMING NOTE (review issue 3): the HIGHER strength 1.0 (node 132) is
+        # wired onto this upscale pass, i.e. "Stage 2" == node 132 @ 1.0. This
+        # inverts the "1.0 and 0.5" reading order of the task description but is
+        # faithful to the JSON. Label is cosmetic; bindings follow the links.
         stage2_ok = True
         stage2_detail = []
         if _wv(21) != EXPECTED_SCHEDULERS[21]:
@@ -1221,6 +1241,18 @@ def _print_honesty_block() -> None:
     print("   - ComfyUI + custom-node import and node execution")
     print("   - CUDA / GPU memory paths and the memory manager under load")
     print("   - final MP4 render via VHS_VideoCombine")
+    print("   - faithful custom-node execution: the executor maps link inputs")
+    print("     to node arg NAMES and builds explicit kwargs for the complex")
+    print("     nodes (LTXDirector 131, Power Lora Loader rgthree 138,")
+    print("     VHS_VideoCombine 139), but the authoritative INPUT_TYPES arg")
+    print("     names are only known once those packages import on Colab. If a")
+    print("     live node names an argument we did not map, it falls back to its")
+    print("     own default (for 138, to the logged builtin-LoraLoader path).")
+    print("     This is safer than positional widget filling but is NOT a")
+    print("     guarantee of byte-identical custom-node semantics.")
+    print("   - checkpoint resume re-executes nodes across a process restart")
+    print("     (node outputs are non-serializable tensors; the checkpoint is a")
+    print("     progress log, not cached compute).")
     print("")
     print(" This report confirms the graph was parsed and its parameters match")
     print(" the source-of-truth JSON. It does NOT claim 'guaranteed no crash':")
@@ -1756,14 +1788,43 @@ class GraphExecutor(object):
 
     # -- checkpoint restore -------------------------------------------------
     def _try_restore(self, node_id: int) -> bool:
+        """Attempt to restore a node's outputs from the checkpoint.
+
+        Review issue 5 (DOCUMENTED LIMITATION): a node's outputs are LIVE GPU
+        tensors / model objects that are not JSON-serializable, so the checkpoint
+        persists only which node ids finished, NOT their outputs. Within a SINGLE
+        process the in-memory `node_outputs` cache already prevents re-execution
+        (see the `self.completed_nodes` short-circuit in `ensure_node_executed`).
+        Across a RESTARTED process we cannot reuse a previously computed tensor,
+        so we deliberately RE-EXECUTE rather than hand a downstream node a `None`
+        it would silently mis-consume. Returning False here (when no live output
+        exists) records that honest limitation instead of faking a skip.
+        """
         if self.checkpoint is None:
             return False
-        return self.checkpoint.is_completed(node_id)
+        if not self.checkpoint.is_completed(node_id):
+            return False
+        # Only a live in-memory output can be safely reused; persisted state
+        # carries no tensors. If we have the tensor cached this process, reuse it.
+        if node_id in self.node_outputs:
+            print("[Node %s] restored from in-process cache (checkpoint marked complete)."
+                  % node_id)
+            return True
+        print("[Node %s] checkpoint marks it complete, but its live output is not "
+              "in this process; RE-EXECUTING (outputs are non-serializable tensors)."
+              % node_id)
+        return False
 
     # -- core execution -----------------------------------------------------
     def ensure_node_executed(self, node_id: int) -> None:
         """Execute `node_id` (and its dependencies) once, caching outputs."""
         if node_id in self.completed_nodes:
+            return
+        # Consult the checkpoint (issue 5). This can only short-circuit when a
+        # live output is already cached this process; a restart re-executes
+        # because tensor outputs are not persisted (documented in _try_restore).
+        if self._try_restore(node_id):
+            self.completed_nodes.add(node_id)
             return
         if node_id in self._executing:
             raise GraphExecutionError(
@@ -1831,12 +1892,123 @@ class GraphExecutor(object):
             self.mem["deep_memory_cleanup"]("post-node-%s" % node_id)
         return outputs
 
+    def _linked_kwargs_by_name(self, node: Dict[str, Any], arg_names: List[str],
+                               resolved_inputs: Dict[int, Any]) -> Dict[str, Any]:
+        """Map each linked input slot to its ARG NAME (never by position).
+
+        Review issue 2: the JSON `inputs[]` array index (`to_slot`) is NOT the
+        INPUT_TYPES ordinal. ComfyUI reorders `inputs[]` when widgets are
+        converted to sockets, so a positional slot->arg map is unsafe. We resolve
+        each linked slot back to `node["inputs"][slot]["name"]` and pass THAT name
+        as the kwarg (only if the node actually declares it in INPUT_TYPES).
+
+        Review issue 4: unlinked optional sockets (e.g. LTXDirector 131's
+        `optional_latent`/`global_prompt`) are simply absent from
+        `resolved_inputs`, so they are never filled here and the node applies its
+        own default.
+        """
+        node_inputs = node.get("inputs") or []
+        argset = set(arg_names)
+        kwargs: Dict[str, Any] = {}
+        for slot in sorted(resolved_inputs.keys()):
+            name = None
+            if slot < len(node_inputs) and isinstance(node_inputs[slot], dict):
+                name = node_inputs[slot].get("name")
+            if name is None and slot < len(arg_names):
+                # Fallback only if the JSON lacks an input name for this slot.
+                name = arg_names[slot]
+            if name is not None and name in argset:
+                kwargs[name] = resolved_inputs[slot]
+        return kwargs
+
+    def _custom_node_kwargs(self, node_id: int, node: Dict[str, Any],
+                            arg_names: List[str], linked_kwargs: Dict[str, Any],
+                            widgets: Any) -> Optional[Dict[str, Any]]:
+        """Explicit per-node widget->arg construction for the complex nodes.
+
+        Review issue 1: LTXDirector 131, Power Lora Loader (rgthree) 138, and
+        VHS_VideoCombine 139 do NOT store `widgets_values` as a positional list
+        of their function arguments, so the generic positional fill would feed
+        UI/serialized/dynamic entries into the wrong parameters. For these nodes
+        we build kwargs by NAME, taking only widget values whose meaning we can
+        anchor to the node's declared INPUT_TYPES arg names, and we DO NOT
+        back-fill any arg we cannot confidently map (the node then applies its
+        own default). Returns None for all other node types (use generic fill).
+
+        NOTE (honest residual risk, mirrored in the Section-40 block): we do not
+        import the custom node packages in this sandbox, so the authoritative
+        INPUT_TYPES arg names are unknown here. On real Colab we intersect the
+        widget values we DO understand with the live INPUT_TYPES keys by name;
+        anything not matched by name is left to the node default rather than
+        guessed positionally. This is strictly safer than the old positional
+        fill but is not a substitute for ComfyUI's own PromptExecutor.
+        """
+        node_type = node.get("type")
+        argset = set(arg_names)
+
+        if node_type == "LTXDirector":
+            # Node 131 widgets_values is a UI list: timeline scalars + a
+            # serialized timeline JSON string + preview/size controls. Its real
+            # inputs (model/clip/audio_vae) arrive via links and are already in
+            # linked_kwargs. optional_latent/global_prompt are UNLINKED optional
+            # sockets and MUST stay unset (issue 4) so the node uses defaults /
+            # reads the global prompt from its serialized timeline. We therefore
+            # pass ONLY the linked inputs plus any timeline scalar whose name the
+            # live node actually declares (matched by name, never positionally).
+            kwargs = dict(linked_kwargs)
+            tl = self.graph.get("timeline") or {}
+            # Candidate scalar timeline params keyed by the LIKELY arg name; only
+            # applied if the live INPUT_TYPES declares that exact name.
+            candidates = {
+                "frame_rate": tl.get("fps"),
+                "fps": tl.get("fps"),
+                "duration": tl.get("duration"),
+                "frames": tl.get("frames"),
+                "length": tl.get("frames"),
+            }
+            for name, val in candidates.items():
+                if name in argset and name not in kwargs and val is not None:
+                    kwargs[name] = val
+            # Explicitly do NOT populate optional_latent / global_prompt.
+            for skip in ("optional_latent", "global_prompt"):
+                kwargs.pop(skip, None)
+            return kwargs
+
+        if node_type == "Power Lora Loader (rgthree)":
+            # Node 138 widgets_values is a list of dynamic rgthree dicts (a header
+            # dict + one dict per LoRA row), NOT positional args. We never feed
+            # those dicts to arg names. On the primary path we pass only the
+            # linked model/clip; if the live rgthree node cannot consume that
+            # bare call, execute_node()'s documented fallback applies the four
+            # LoRAs via builtin LoraLoader with identical strengths (logged).
+            return dict(linked_kwargs)
+
+        if node_type == "VHS_VideoCombine":
+            # Node 139 widgets_values is a dict; keys that coincide with the live
+            # INPUT_TYPES arg names are passed by NAME. Non-arg keys (UI state
+            # such as 'videopreview') are dropped by the name intersection.
+            kwargs = dict(linked_kwargs)
+            if isinstance(widgets, dict):
+                for name in arg_names:
+                    if name in kwargs:
+                        continue
+                    if name in widgets:
+                        kwargs[name] = widgets[name]
+            return kwargs
+
+        return None
+
     def _call_comfy_node(self, node_id: int, node: Dict[str, Any], node_cls: Any,
                          resolved_inputs: Dict[int, Any]) -> Dict[int, Any]:
         """Map inputs+widgets to the node's FUNCTION args and call it.
 
-        Slot inputs (from links) are matched to INPUT_TYPES arg names in order;
-        remaining declared args are filled from widgets_values positionally. The
+        Link inputs are matched to INPUT_TYPES arg NAMES via each input socket's
+        declared name (see `_linked_kwargs_by_name`), never by slot position.
+        The workflow's three complex custom nodes get EXPLICIT per-node argument
+        construction (see `_custom_node_kwargs`) because their `widgets_values`
+        are UI/serialized/dynamic entries, NOT a positional function-arg list.
+        For the remaining simple builtin nodes, declared args still unfilled are
+        taken from `widgets_values` (list => positional, dict => by name). The
         ComfyUI return convention (tuple/list/dict/{'result':..}/{'ui':..}) is
         normalized to {slot_index: value}.
         """
@@ -1851,16 +2023,17 @@ class GraphExecutor(object):
             arg_names = self._ordered_input_names(node_cls)
             widgets = node.get("widgets_values")
 
-            kwargs: Dict[str, Any] = {}
-            # 1) Fill args that are wired via links (by declaration order == slot).
-            #    ComfyUI input slots correspond to required+optional order.
-            linked_slots = sorted(resolved_inputs.keys())
-            # Map each input slot index -> arg name (slots index INPUT_TYPES order).
-            for slot in linked_slots:
-                if slot < len(arg_names):
-                    kwargs[arg_names[slot]] = resolved_inputs[slot]
-            # 2) Fill the remaining declared args from widgets_values positionally.
-            if isinstance(widgets, (list, tuple)):
+            # 1) Fill args wired via links, matched by input NAME (issue 2).
+            kwargs = self._linked_kwargs_by_name(node, arg_names, resolved_inputs)
+
+            # 2) Fill declared-but-unlinked args from widgets_values.
+            #    Complex custom nodes (131/138/139) need EXPLICIT construction
+            #    (issue 1) rather than the positional widget fill, whose
+            #    assumption "widgets_values == positional args" is false for them.
+            custom = self._custom_node_kwargs(node_id, node, arg_names, kwargs, widgets)
+            if custom is not None:
+                kwargs = custom
+            elif isinstance(widgets, (list, tuple)):
                 wi = 0
                 for name in arg_names:
                     if name in kwargs:
@@ -1869,7 +2042,7 @@ class GraphExecutor(object):
                         kwargs[name] = widgets[wi]
                         wi += 1
             elif isinstance(widgets, dict):
-                # VHS_VideoCombine stores widgets as a dict keyed by arg name.
+                # dict-widget nodes store values keyed by arg name.
                 for name in arg_names:
                     if name in kwargs:
                         continue
@@ -2150,11 +2323,17 @@ CHECKPOINT_FILENAME = "workflow_state.json"
 
 
 class CheckpointManager(object):
-    """Persist/restore execution progress to workflow_state.json.
+    """Persist/restore execution PROGRESS to workflow_state.json.
 
-    Tracks completed node ids so a resumed run can skip re-executing expensive
-    nodes. State schema: {current_node, phase, completed_nodes, output_paths,
-    timeline_state, error_state}.
+    This is a progress LOG, not crash-recovery of computed work. It records
+    which node ids finished (plus phase / output paths / error state) so a
+    resumed process can report where it stopped. It deliberately does NOT cache
+    node OUTPUTS: those are live GPU tensors / model objects that are not
+    JSON-serializable. Consequently a RESTARTED run re-executes nodes (there is
+    no cached tensor to reuse); only WITHIN a single process does the executor's
+    in-memory cache skip re-execution. See GraphExecutor._try_restore for how
+    this limitation is honored (issue 5). State schema: {current_node, phase,
+    completed_nodes, output_paths, timeline_state, error_state}.
     """
 
     def __init__(self, path: Optional[str] = None) -> None:
