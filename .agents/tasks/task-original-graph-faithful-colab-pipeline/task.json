@@ -1,0 +1,7 @@
+{
+  "task_id": "task-original-graph-faithful-colab-pipeline",
+  "task_description": "Create a single self-contained Google Colab Python script (LTX23_Director_OriginalGraph_Colab.py) that faithfully re-executes the ORIGINAL ComfyUI graph LTX-2.3_Director_2.0-MV-Workflow-30s.json by loading the JSON as source of truth, parsing it into an internal graph, and topologically executing the REAL registered ComfyUI node classes via a memory-aware execute_node() layer, with LTXDirector (node 131) remaining the master timeline controller. Memory-management infrastructure is lifted from LTX23_Director_Master_V2.py; the FORBIDDEN 5-segment architecture from V2/V3 must NOT be reproduced. Because the sandbox has no GPU/ComfyUI/models, only the pure-Python parser + graph validator + self-audit (runnable via --validate-only) are provable here; GPU execution requires a real Colab T4 run.",
+  "status": "in_progress",
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003"],
+  "blocked_reason": null
+}

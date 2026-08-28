@@ -1,0 +1,24 @@
+{
+  "id": "FEAT-003",
+  "type": "feat",
+  "description": "Add the Section-41 FINAL SELF-CHECK / workflow audit report generator to LTX23_Director_OriginalGraph_Colab.py and wire it so it is produced (a) automatically at the end of `--validate-only` and (b) as CELL 18/end-of-run audit on real Colab. The audit prints every Section-41 checklist item with a PASS/[x] status computed from the PARSED graph (not hardcoded), and a final honesty statement per Section 40 distinguishing what was statically validated vs what requires a real Colab T4 run. This produces the Section-41 self-audit report the orchestrator needs as a deliverable artifact.",
+  "status": "pending",
+  "steps": [
+    "Implement generate_self_audit(graph, timeline) that evaluates each of the ~40 Section-41 checklist items against the parsed graph/timeline and prints them as a checkbox list (e.g. '[x] LTXDirector exists', '[x] timeline = 31.5 seconds', '[x] frames = 756', '[x] Stage 1 = Euler / 8 steps / denoise 1.0', '[x] 4 LoRAs preserved', '[x] LoRA strengths = 0.4 / 0.6 / 0.7 / 0.9', ... through '[x] no silent exception swallowing', '[x] no placeholder reference images'). Each item's checked/unchecked state must be DERIVED from the parsed graph where derivable (node presence, strengths, sampler/scheduler/steps/denoise, timeline scalars, audio trim, VHS params); items that assert code-structure properties (no 5-scene loop, no linear_blend_overlap, memory infra only, no silent swallow) are asserted true by construction with a one-line justification.",
+    "Print a final Section-40 honesty block: statically validated in-sandbox = JSON parse + 32-node graph parse + graph validator all-PASS + py_compile clean + self-audit; NOT verified in-sandbox = model download, ComfyUI node execution, CUDA/GPU paths, final MP4 render (requires real Colab T4). Explicitly do NOT print 'guaranteed no crash'.",
+    "Call generate_self_audit at the end of the `--validate-only` path (after the validator) so the audit is provable in-sandbox, and also invoke it at end-of-run on Colab.",
+    "Run `python3 -m py_compile` and `python3 LTX23_Director_OriginalGraph_Colab.py --validate-only` and confirm the validator report AND the Section-41 self-audit AND the honesty block all print, exiting 0."
+  ],
+  "acceptance_criteria": [
+    "`python3 LTX23_Director_OriginalGraph_Colab.py --validate-only` prints the Section-27 validation report (all PASS), the full Section-41 checklist (all items checked), and the Section-40 honesty block, exiting 0.",
+    "Checklist states are computed from the parsed graph/timeline (changing e.g. a LoRA strength in the JSON would flip the corresponding item), not hardcoded to always-true.",
+    "The honesty block clearly separates statically-validated-in-sandbox from requires-real-Colab-T4, and never claims 'guaranteed no crash'.",
+    "`python3 -m py_compile LTX23_Director_OriginalGraph_Colab.py` exits 0."
+  ],
+  "verification": [
+    "cd /projects/sandbox/code && python3 -m py_compile LTX23_Director_OriginalGraph_Colab.py",
+    "cd /projects/sandbox/code && python3 LTX23_Director_OriginalGraph_Colab.py --validate-only ; echo EXIT=$? (expect validation report + Section-41 audit + honesty block, EXIT=0)"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}
