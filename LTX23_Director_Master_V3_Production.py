@@ -181,8 +181,17 @@ if torch.cuda.is_available():
 
 # @markdown ### 🧠 DiT Model (T4 VRAM sizing — see note)
 # @markdown Q3_K_S(~9.5GB, T4-safe) · Q3_K_M(~10.5GB) · Q4_K_S(~11.8GB) · Q4_K_M(~12.5GB, needs >15GB VRAM)
+# @markdown `distilled` converges in fewer steps (faster). If you pick "distilled",
+# @markdown turn OFF use_lora_1 below (it is the distill delta already baked into that base).
+model_variant = "dev"           # @param ["dev", "distilled"]
 dit_quant = "Q3_K_S"            # @param ["Q3_K_S", "Q3_K_M", "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0"]
-force_gpu_resident_dit = False  # @param {type:"boolean"}
+# @markdown Keep the DiT fully on GPU (avoids the CPU offload that makes each step take minutes). Turn OFF only if you hit CUDA OOM.
+force_gpu_resident_dit = True   # @param {type:"boolean"}
+
+# @markdown ### ⚡ Performance (speed vs VRAM)
+# @markdown `ff_chunks`: 0 = fastest (no FFN chunking, needs most VRAM) · 8 = slowest/safest. Try 0 or 2 once the model fits.
+ff_chunks = 2                   # @param [0, 1, 2, 4, 8] {type:"raw"}
+use_sage_attention = False      # @param {type:"boolean"}
 
 # @markdown ### 🖥️ Resolution & Output
 custom_width = 1280            # @param [768, 832, 960, 1024, 1152, 1280] {type:"raw"}
@@ -303,11 +312,14 @@ def link_file_safe(src_path: str, dst_path: str):
 #   Q3_K_S ≈  9.5 GB | ~6 GB  -> RECOMMENDED for T4 free tier
 # Set via the `dit_quant` / `force_gpu_resident_dit` fields in Master Settings.
 DIT_QUANT = os.environ.get("LTX_DIT_QUANT", dit_quant)
-DIT_GGUF_FILENAME = f"ltx-2-3-22b-dev-{DIT_QUANT}.gguf"
-DIT_GGUF_URL = f"https://huggingface.co/vantagewithai/LTX-2.3-GGUF/resolve/main/dev/{DIT_GGUF_FILENAME}"
+DIT_VARIANT = os.environ.get("LTX_DIT_VARIANT", model_variant)  # "dev" or "distilled"
+DIT_GGUF_FILENAME = f"ltx-2-3-22b-{DIT_VARIANT}-{DIT_QUANT}.gguf"
+DIT_GGUF_URL = f"https://huggingface.co/vantagewithai/LTX-2.3-GGUF/resolve/main/{DIT_VARIANT}/{DIT_GGUF_FILENAME}"
 FORCE_GPU_RESIDENT_DIT = force_gpu_resident_dit or (os.environ.get("LTX_FORCE_GPU_RESIDENT", "0") == "1")
+FF_CHUNKS = int(ff_chunks)
+USE_SAGE_ATTENTION = bool(use_sage_attention)
 
-print(f"📦 Downloading LTX-2.3 Core Models... (DiT quant: {DIT_QUANT})")
+print(f"📦 Downloading LTX-2.3 Core Models... (DiT: {DIT_VARIANT} {DIT_QUANT})")
 
 dit_model = download_file(
     DIT_GGUF_URL,
@@ -1431,21 +1443,26 @@ def load_dit_and_loras():
                 model = gv(ll.load_lora_model_only(model=model, lora_name=lora_cfg[0], strength_model=lora_cfg[1]), 0)
                 print(f"    + LoRA applied: {lora_cfg[0]} (Strength {lora_cfg[1]})")
 
-    # SageAttention & Chunk Feed Forward Hooks
-    if "PatchSageAttentionKJ" in NODE_CLASS_MAPPINGS:
+    # SageAttention & Chunk Feed Forward Hooks (both configurable for speed).
+    # NOTE: SageAttention needs Ampere+ (sm_80); it is a no-op/unsupported on the
+    # T4 (Turing sm_75), so it defaults OFF. FF chunking trades speed for VRAM —
+    # ff_chunks=0 disables it (fastest) once the quant fits in VRAM.
+    if USE_SAGE_ATTENTION and "PatchSageAttentionKJ" in NODE_CLASS_MAPPINGS:
         try:
             sage = NODE_CLASS_MAPPINGS["PatchSageAttentionKJ"]()
             model = gv(call_original_node("PatchSageAttentionKJ", node_instance=sage, model=model, sage_attention="auto"), 0) or model
             print("  ✓ SageAttention Hook Applied.")
         except Exception:
             pass
-    if "LTXVChunkFeedForward" in NODE_CLASS_MAPPINGS:
+    if FF_CHUNKS and FF_CHUNKS > 0 and "LTXVChunkFeedForward" in NODE_CLASS_MAPPINGS:
         try:
             cff = NODE_CLASS_MAPPINGS["LTXVChunkFeedForward"]()
-            model = gv(call_original_node("LTXVChunkFeedForward", node_instance=cff, model=model, chunks=8, dim_threshold=4096), 0) or model
-            print("  ✓ ChunkFeedForward Hook Applied (chunks=8).")
+            model = gv(call_original_node("LTXVChunkFeedForward", node_instance=cff, model=model, chunks=FF_CHUNKS, dim_threshold=4096), 0) or model
+            print(f"  ✓ ChunkFeedForward Hook Applied (chunks={FF_CHUNKS}).")
         except Exception:
             pass
+    else:
+        print("  ✓ ChunkFeedForward disabled (ff_chunks=0) -> faster FFN, higher VRAM.")
 
     # Optionally pin the DiT fully-resident on GPU so ComfyUI never pages the
     # 22B weights through host RAM (the mid-sampling OOM path). Only enable when
@@ -1462,6 +1479,12 @@ def load_dit_and_loras():
             print("  ✓ DiT pinned fully-resident on GPU (host-RAM offload disabled).")
         except Exception as e:
             print(f"  [Notice] Could not pin DiT to GPU (continuing with smart offload): {e}")
+
+    # Residency diagnostic: if 'GPU Alloc' is far below the model size, ComfyUI is
+    # streaming weights from host RAM -> that is why each step takes minutes.
+    _s = LTXDirectorMemoryManager.get_memory_stats()
+    print(f"  📊 Post-load: GPU Alloc {_s['gpu_alloc_gb']:.2f} GB | GPU Free {_s['gpu_free_gb']:.2f} GB | "
+          f"RAM Free {_s['ram_avail_gb']:.2f} GB  (low Alloc => offloading => slow)")
 
     return model
 
