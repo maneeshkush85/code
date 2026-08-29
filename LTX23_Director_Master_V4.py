@@ -605,13 +605,19 @@ def patch_comfy_memory_manager():
     try:
         import comfy.model_management as mm
 
-        # --- Force LOW_VRAM streaming (keeps the giant DiT off the GPU until sampling) ---
+        # --- NORMAL_VRAM = FAST path ---
+        # The 22B GGUF DiT (~13 GB) FITS on the 15 GB T4, so we keep it fully
+        # resident on the GPU for fast sampling (LOW_VRAM streamed every layer
+        # from CPU/swap and was the real cause of the slowness). The text-encode
+        # OOM is avoided differently: we unload_all_models() right before the
+        # Director runs, so Gemma-12B gets the whole GPU to itself (fast), and the
+        # DiT only moves onto the GPU afterwards for sampling.
         try:
-            mm.vram_state = mm.VRAMState.LOW_VRAM
-            mm.set_vram_to = mm.VRAMState.LOW_VRAM
-            print("  · ComfyUI VRAM state -> LOW_VRAM (stream weights, DiT stays on CPU when idle)")
+            mm.vram_state = mm.VRAMState.NORMAL_VRAM
+            mm.set_vram_to = mm.VRAMState.NORMAL_VRAM
+            print("  · ComfyUI VRAM state -> NORMAL_VRAM (DiT resident on GPU = fast sampling)")
         except Exception as e:
-            print(f"  · Could not set LOW_VRAM state: {e}")
+            print(f"  · Could not set NORMAL_VRAM state: {e}")
 
         if not getattr(mm, "_is_free_memory_patched", False):
             _orig_free_memory = mm.free_memory
