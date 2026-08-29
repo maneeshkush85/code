@@ -593,11 +593,26 @@ def malloc_trim_os():
 
 
 def patch_comfy_memory_manager():
-    """Patch ComfyUI memory helpers: (1) make free_memory always return a list
-    (fixes a TypeError), (2) report ~1.2 GB LESS free VRAM than reality so the
-    scheduler leaves headroom for LoRA delta tensors during DiT sampling."""
+    """Configure ComfyUI memory management for a 15 GB T4 holding a 22B GGUF DiT.
+
+    CRITICAL for the Director path: the 22B DiT (~13 GB) cannot coexist on the
+    GPU with the Gemma-12B text encoder + VAE. So we force ComfyUI into
+    LOW_VRAM state — model weights live on CPU/RAM and are streamed to the GPU
+    only for their own forward pass. During LTXDirector.execute (text-encode +
+    latent/guide prep) the DiT therefore stays on CPU, leaving the GPU free for
+    the encoder and VAE. We DO NOT pin the text encoder to CUDA (that would stop
+    ComfyUI from moving things off the GPU and re-trigger OOM)."""
     try:
         import comfy.model_management as mm
+
+        # --- Force LOW_VRAM streaming (keeps the giant DiT off the GPU until sampling) ---
+        try:
+            mm.vram_state = mm.VRAMState.LOW_VRAM
+            mm.set_vram_to = mm.VRAMState.LOW_VRAM
+            print("  · ComfyUI VRAM state -> LOW_VRAM (stream weights, DiT stays on CPU when idle)")
+        except Exception as e:
+            print(f"  · Could not set LOW_VRAM state: {e}")
+
         if not getattr(mm, "_is_free_memory_patched", False):
             _orig_free_memory = mm.free_memory
             def _safe_free_memory(*args, **kwargs):
@@ -608,38 +623,32 @@ def patch_comfy_memory_manager():
                     return []
             mm.free_memory = _safe_free_memory
 
+            # Small ~256 MB shield only (LOW_VRAM already keeps footprint low; a big
+            # shield here would wrongly make ComfyUI think there is no room at all).
             _orig_get_free_memory = mm.get_free_memory
             def _buffered_get_free_memory(dev=None, torch_free_too=False):
                 try:
                     free = _orig_get_free_memory(dev, torch_free_too)
-                    return max(512 * 1024 * 1024, free - 1200 * 1024 * 1024)
+                    return max(256 * 1024 * 1024, free - 256 * 1024 * 1024)
                 except Exception:
-                    return 2 * 1024 * 1024 * 1024
+                    return 1 * 1024 * 1024 * 1024
             mm.get_free_memory = _buffered_get_free_memory
             mm._is_free_memory_patched = True
 
-        # Keep the (small) text-encoder resident on GPU when possible.
-        mm.text_encoder_device = lambda: torch.device("cuda")
-        mm.text_encoder_offload_device = lambda: torch.device("cuda")
+        # NOTE: intentionally NOT overriding text_encoder_device/offload_device —
+        # ComfyUI's default logic will place the encoder on the GPU only after
+        # freeing the DiT, or fall back to CPU encoding, both of which are safe.
     except Exception as e:
         print(f"Memory patch notice: {e}")
 
 
 def patch_safetensors_direct_to_gpu():
-    try:
-        import safetensors.torch
-        if not getattr(safetensors.torch, "_is_cuda_direct_patched", False):
-            _orig = safetensors.torch.load_file
-            def _safe_cuda_load(filename, device="cpu"):
-                fn = str(filename).lower()
-                if any(k in fn for k in ["gemma", "clip", "text_encoder", "projection", "connector"]):
-                    if torch.cuda.is_available():
-                        return _orig(filename, device="cuda")
-                return _orig(filename, device=device)
-            safetensors.torch.load_file = _safe_cuda_load
-            safetensors.torch._is_cuda_direct_patched = True
-    except Exception:
-        pass
+    """Deliberately a NO-OP in V4.
+
+    In V2 this force-loaded the Gemma/CLIP weights straight to CUDA. On the T4
+    that guarantees OOM because the DiT is already resident. We now let ComfyUI's
+    LOW_VRAM manager decide device placement instead."""
+    return
 
 
 patch_comfy_memory_manager()
@@ -1267,6 +1276,18 @@ def run_master_timeline_controller(model, clip, audio_vae):
     if director_cls is None:
         raise RuntimeError("LTXDirector node missing — cannot drive the Master Timeline. "
                            "Ensure WhatDreamsCost-ComfyUI is installed (Cell 4).")
+
+    # Free the GPU before the Director text-encodes: push any resident weights
+    # (incl. the 22B DiT) back to CPU so Gemma-12B + the VAE have room. In
+    # LOW_VRAM mode the DiT will re-stream to the GPU later, at sampling time.
+    try:
+        import comfy.model_management as mm
+        mm.unload_all_models()
+        mm.soft_empty_cache()
+    except Exception:
+        pass
+    clear_memory("pre_director")
+    print(f"  · GPU cleared for Director text-encode (free RAM {get_ram_free_gb():.2f} GB)")
 
     director = director_cls()
     # Pass model/clip/audio_vae + every timeline widget; dispatcher keeps the ones
