@@ -870,27 +870,86 @@ def sync_latent_device(latent: Any, target_device: Union[str, torch.device] = "c
     return latent_dict
 
 
-# ---- Reflection-based node dispatcher ---------------------------------------
+# ---- INPUT_TYPES-driven node dispatcher -------------------------------------
+def _default_from_meta(meta: Any) -> Any:
+    """Pick a sane default for a ComfyUI INPUT_TYPES entry we weren't given.
+    meta forms: ("INT",{opts}) | ("FLOAT",{opts}) | ("STRING",{opts}) |
+                ("BOOLEAN",{opts}) | ([choices],{opts}) | ("MODEL",) | "TYPE"."""
+    t = meta[0] if isinstance(meta, (list, tuple)) and len(meta) > 0 else meta
+    opts = meta[1] if (isinstance(meta, (list, tuple)) and len(meta) > 1 and isinstance(meta[1], dict)) else {}
+    if isinstance(t, (list, tuple)):                 # dropdown choices
+        return opts.get("default", t[0] if len(t) > 0 else None)
+    if t == "INT":
+        return opts.get("default", 0)
+    if t == "FLOAT":
+        return opts.get("default", 0.0)
+    if t == "BOOLEAN":
+        return opts.get("default", False)
+    if t == "STRING":
+        return opts.get("default", "")
+    return None                                      # tensor/model/latent slots
+
+
 def call_node(node_instance: Any, **kwargs) -> Any:
-    """Call a ComfyUI node without the graph engine. We inspect the node's
-    FUNCTION signature and pass only the kwargs it accepts, filling required
-    params we didn't supply with type-appropriate defaults. This tolerates the
-    custom whatdreamscost nodes whose exact signatures we cannot see ahead of
-    time."""
+    """Call a ComfyUI node without the graph engine.
+
+    IMPORTANT: modern ComfyUI (V3 schema) nodes declare `execute(cls, **kwargs)`
+    with a GENERIC signature, so inspecting the function signature yields no
+    parameter names. We therefore build the call kwargs from the node's declared
+    `INPUT_TYPES()` (required + optional), which is the authoritative contract.
+    Required inputs we weren't given are filled with spec defaults. Extra kwargs
+    (e.g. rgthree Power-Lora dynamic entries) are forwarded only when the target
+    accepts **kwargs. We do NOT swallow the node's real exception."""
+    cls = type(node_instance)
+    spec_req: Dict[str, Any] = {}
+    spec_opt: Dict[str, Any] = {}
+    try:
+        it = cls.INPUT_TYPES()
+        spec_req = it.get("required", {}) or {}
+        spec_opt = it.get("optional", {}) or {}
+    except Exception:
+        pass
+
+    # Pick the primary callable.
     func_name = getattr(node_instance, "FUNCTION", None)
-    callables = []
+    primary = None
     if func_name and hasattr(node_instance, func_name):
-        callables.append(getattr(node_instance, func_name))
-    if hasattr(node_instance, "execute"):
-        callables.append(node_instance.execute)
+        primary = getattr(node_instance, func_name)
+    elif hasattr(node_instance, "execute"):
+        primary = getattr(node_instance, "execute")
+    elif hasattr(node_instance, "EXECUTE_NORMALIZED"):
+        primary = getattr(node_instance, "EXECUTE_NORMALIZED")
+
+    if (spec_req or spec_opt) and primary is not None:
+        call_kwargs: Dict[str, Any] = {}
+        # Required: use provided value, else a spec default.
+        for name, meta in spec_req.items():
+            call_kwargs[name] = kwargs[name] if name in kwargs else _default_from_meta(meta)
+        # Optional: include only when the caller supplied a non-None value.
+        for name in spec_opt:
+            if name in kwargs and kwargs[name] is not None:
+                call_kwargs[name] = kwargs[name]
+        # Forward extra dynamic kwargs (rgthree loras etc.) if **kwargs accepted.
+        try:
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD
+                             for p in inspect.signature(primary).parameters.values())
+        except Exception:
+            has_var_kw = True
+        if has_var_kw:
+            for k, v in kwargs.items():
+                if k not in call_kwargs and v is not None:
+                    call_kwargs[k] = v
+        return primary(**call_kwargs)  # let real errors propagate (no masking)
+
+    # Fallback for legacy nodes without usable INPUT_TYPES: signature-based.
+    callables = []
+    if primary is not None:
+        callables.append(primary)
     for fb in ["get_guider", "get_noise", "get_sampler", "get_sigmas", "sample",
                "apply_guide", "crop_guides", "upsample_latent", "concat",
-               "separate", "encode", "decode", "generate", "process", "run", "director"]:
+               "separate", "encode", "decode", "generate", "process", "run"]:
         if hasattr(node_instance, fb):
             callables.append(getattr(node_instance, fb))
-    if hasattr(node_instance, "EXECUTE_NORMALIZED"):
-        callables.append(node_instance.EXECUTE_NORMALIZED)
-
     last_err = None
     for func in callables:
         try:
@@ -904,16 +963,16 @@ def call_node(node_instance: Any, **kwargs) -> Any:
                 if name in kwargs:
                     valid[name] = kwargs[name]
                 elif param.default is not inspect.Parameter.empty:
-                    pass  # let the node use its own default (widget value)
+                    pass
                 else:
                     ann = str(param.annotation)
-                    if param.annotation == int or "int" in ann:
+                    if "int" in ann:
                         valid[name] = 0
-                    elif param.annotation == float or "float" in ann:
+                    elif "float" in ann:
                         valid[name] = 0.0
-                    elif param.annotation == bool or "bool" in ann:
+                    elif "bool" in ann:
                         valid[name] = False
-                    elif param.annotation == str or "str" in ann:
+                    elif "str" in ann:
                         valid[name] = ""
                     else:
                         valid[name] = None
@@ -1114,15 +1173,13 @@ def build_model_stack():
     except Exception:
         pass
 
-    # --- (10) ModelPreviewOverrideKJ: wraps model (+ optional preview VAE) ---
-    if "ModelPreviewOverrideKJ" in NODE_CLASS_MAPPINGS:
-        try:
-            mp = NODE_CLASS_MAPPINGS["ModelPreviewOverrideKJ"]()
-            res = call_node(mp, model=model, vae=tiny_vae)
-            model = gv(res, 0) or model
-            print("  ✓ ModelPreviewOverrideKJ applied")
-        except Exception as e:
-            print(f"  [Notice] ModelPreviewOverrideKJ skipped: {e}")
+    # --- (10) ModelPreviewOverrideKJ ---
+    # This is a UI-only live-preview passthrough (it periodically taeltx-decodes
+    # latents to show progress). It does NOT affect the generated result, and on a
+    # T4 the extra per-step decode wastes VRAM. We deliberately SKIP it and keep
+    # the raw model. (tiny_vae is still downloaded/available if you want previews.)
+    _ = tiny_vae  # intentionally unused; preview override skipped for memory safety
+    print("  · ModelPreviewOverrideKJ skipped (preview-only; no effect on output)")
 
     # --- Attention / feed-forward memory hooks (KJ) — big VRAM savings on T4 ---
     if "PatchSageAttentionKJ" in NODE_CLASS_MAPPINGS:
@@ -1274,14 +1331,23 @@ def make_ltxv_conditioning(positive: Any, frame_rate: float) -> Tuple[Any, Any]:
 
 
 def _director_guide(positive, negative, vae, latent, guide_data, motion_guide_data,
-                    model, image, strength):
-    """Call LTXDirectorGuide (id 132/133). Returns (pos, neg, latent, model)."""
+                    model, scale_by):
+    """Call LTXDirectorGuide (JSON id 132/133). Returns (pos, neg, latent, model).
+
+    NOTE (from runtime INPUT_TYPES introspection): this node takes NO `image` and
+    NO `strength` input — the reference keyframes are already baked into
+    `guide_data` by the Director. The real per-stage control is `scale_by`
+    (JSON widgets: base guide=0.5, refine guide=1.0) plus the fixed guide widgets
+    below (ic_lora_name None, upscale_method bicubic, crop center, tile 256/64)."""
     cls = NODE_CLASS_MAPPINGS.get("LTXDirectorGuide") or NODE_CLASS_MAPPINGS.get("LTXVAddGuide")
     if cls is None:
         return positive, negative, latent, model
     res = call_node(cls(), positive=positive, negative=negative, vae=vae, latent=latent,
                     guide_data=guide_data, motion_guide_data=motion_guide_data, model=model,
-                    image=image, frame_idx=0, strength=float(strength))
+                    ic_lora_name="None", ic_lora_strength=1.0, scale_by=float(scale_by),
+                    upscale_method="bicubic", image_attention_strength=1.0, crop="center",
+                    auto_snap_ic_grid=True, use_tiled_encode=False, tile_size=256,
+                    tile_overlap=64, retake_mode=False)
     p = gv(res, 0); n = gv(res, 1); lat = gv(res, 2); mdl = gv(res, 3)
     return (p if p is not None else positive,
             n if n is not None else negative,
@@ -1346,18 +1412,15 @@ def run_two_stage_diffusion(director_out, workdir: str, resume: bool = True) -> 
     # --- Conditioning (nodes 27 + 128) ---
     pos0, neg0 = make_ltxv_conditioning(director_out["positive"], frame_rate)
 
-    # Reference image = first segment keyframe (identity anchor for whole timeline).
-    ref_path = SEGMENTS[0]["imageFile"]
-
     # ======================= STAGE 1 (base resolution) ========================
+    # The base guide uses scale_by=0.5 (JSON node 133) to work at half-res; the
+    # keyframe identity is already carried inside guide_data from the Director.
     print("\n" + "=" * 70 + "\n🎬 STAGE 1: Base diffusion over full timeline\n" + "=" * 70)
     video_vae = load_vae_helper("LTX23_video_vae_bf16.safetensors", device="main_device", dtype="bf16")
-    ref_img1 = prepare_reference_image(ref_path, width // 2, height // 2)
 
     p1, n1, lat1, m1 = _director_guide(pos0, neg0, video_vae, director_out["video_latent"],
-                                       guide_data, motion_guide, dmodel, ref_img1,
-                                       GUIDE_STRENGTH_STAGE1)
-    del video_vae, ref_img1
+                                       guide_data, motion_guide, dmodel, scale_by=0.5)
+    del video_vae
     clear_memory("post_stage1_guide")
 
     av1_in = sync_latent_device(gv(call_node(concat, video_latent=lat1,
@@ -1384,11 +1447,12 @@ def run_two_stage_diffusion(director_out, workdir: str, resume: bool = True) -> 
     clear_memory("post_upscale")
 
     # ======================= STAGE 2 (refine @ target res) ====================
+    # The refine guide uses scale_by=1.0 (JSON node 132): keeps the upscaled
+    # resolution and re-anchors identity before the low-denoise refinement pass.
     print("\n" + "=" * 70 + f"\n🎬 STAGE 2: Refinement @ {width}x{height}\n" + "=" * 70)
-    ref_img2 = prepare_reference_image(ref_path, width, height)
     p2, n2, lat2, m2 = _director_guide(pos0, neg0, video_vae, v_ups, guide_data,
-                                       motion_guide, dmodel, ref_img2, GUIDE_STRENGTH_STAGE2)
-    del video_vae, ref_img2, v_ups
+                                       motion_guide, dmodel, scale_by=1.0)
+    del video_vae, v_ups
     clear_memory("post_stage2_guide")
 
     av2_in = sync_latent_device(gv(call_node(concat, video_latent=lat2, audio_latent=a1), 0), "cpu")
