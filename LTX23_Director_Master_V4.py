@@ -1598,11 +1598,71 @@ def mux_song(video_path: str, song_path: str, trim_start_frames: float,
     return out_path if os.path.exists(out_path) else video_path
 
 
+# ---- Director-state caching (skip the slow text-encode on re-runs) ----------
+def _cond_to_cpu(cond: Any) -> Any:
+    """Move a ComfyUI conditioning (list of [tensor, dict]) to CPU for pickling."""
+    if not isinstance(cond, (list, tuple)):
+        return cond
+    out = []
+    for item in cond:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            t = item[0].cpu() if torch.is_tensor(item[0]) else item[0]
+            d = {}
+            for k, v in (item[1] or {}).items():
+                d[k] = v.cpu() if torch.is_tensor(v) else v
+            out.append([t, d])
+        else:
+            out.append(item)
+    return out
+
+
+def save_director_state(director_out: Dict[str, Any], path: str) -> bool:
+    """Persist the EXPENSIVE Director outputs (text-encode conditioning + prepared
+    latents + guide data). The DiT `model` is NOT saved — it is rebuilt on resume
+    (it is needed for sampling anyway). Best-effort: if any object refuses to
+    pickle, we drop the cache and recompute next time."""
+    try:
+        payload = {
+            "positive": _cond_to_cpu(director_out.get("positive")),
+            "video_latent": sync_latent_device(director_out.get("video_latent"), "cpu"),
+            "audio_latent": sync_latent_device(director_out.get("audio_latent"), "cpu"),
+            "guide_data": director_out.get("guide_data"),
+            "motion_guide_data": director_out.get("motion_guide_data"),
+            "frame_rate": float(director_out.get("frame_rate") or fps),
+        }
+        tmp = path + ".tmp"
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+        print(f"  💾 [CACHE] Director state saved: {path}")
+        return True
+    except Exception as e:
+        print(f"  [Notice] Could not cache Director state ({e}); it will recompute next run.")
+        for p in (path, path + ".tmp"):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        return False
+
+
+def load_director_state(path: str, model: Any) -> Dict[str, Any]:
+    """Reload cached Director outputs and attach the freshly built model."""
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    payload["model"] = model
+    payload["combined_audio"] = None
+    return payload
+
+
 def run_director_pipeline(workdir="/content/LTXDirector_Work",
                           outdir="/content/LTXStudio_Output",
                           resume=True) -> Optional[str]:
     """End-to-end: build model stack -> LTXDirector timeline -> 2-stage diffusion
-    -> decode -> assemble -> mux."""
+    -> decode -> assemble -> mux.  Uses two resume checkpoints:
+      1) director_state.pt  — caches the slow text-encode + latent prep
+      2) final_*_latent.pt  — caches the finished 2-stage diffusion latents"""
     os.makedirs(workdir, exist_ok=True)
     os.makedirs(outdir, exist_ok=True)
     patch_comfy_memory_manager()
@@ -1610,19 +1670,43 @@ def run_director_pipeline(workdir="/content/LTXDirector_Work",
     purge_deep("pipeline_start")
     print(f"  [RAM Baseline] Free RAM: {get_ram_free_gb():.2f} GB")
 
+    director_state_file = f"{workdir}/director_state.pt"
+
     with torch.inference_mode():
         video_lat_path = f"{workdir}/final_video_latent.pt"
         audio_lat_path = f"{workdir}/final_audio_latent.pt"
 
         if not (resume and os.path.exists(video_lat_path) and os.path.exists(audio_lat_path)):
             ram_guard(min_ram_guard_gb, "before_build")
+
+            # ========================= PHASE A =============================
+            print("\n" + "=" * 70)
+            print(f"PHASE A: LTXDirector MASTER TIMELINE INGESTION ({TOTAL_FRAMES} frames)")
+            print("=" * 70)
+            t0 = time.time()
+
+            # The DiT model must be rebuilt regardless (needed for sampling).
             model, clip, audio_vae = build_model_stack()
-            director_out = run_master_timeline_controller(model, clip, audio_vae)
-            del model, clip, audio_vae
-            clear_memory("post_director")
+
+            if resume and os.path.exists(director_state_file) and os.path.getsize(director_state_file) > 1024:
+                print(f"  ⏭ [RESUME] Loading cached Director state from: {director_state_file}")
+                director_out = load_director_state(director_state_file, model)
+                del clip, audio_vae
+                print(f"  ✓ Director state restored in {time.time()-t0:.1f}s (skipped text-encode)")
+            else:
+                print("  · Running LTXDirector (text-encode + latent/guide prep). "
+                      "This is the SLOW step on free-tier — please wait...")
+                director_out = run_master_timeline_controller(model, clip, audio_vae)
+                del clip, audio_vae
+                clear_memory("post_director")
+                save_director_state(director_out, director_state_file)
+                print(f"  ✓ PHASE A done in {time.time()-t0:.1f}s")
+
+            del model
+            clear_memory("post_phase_a")
             video_lat_path, audio_lat_path = run_two_stage_diffusion(director_out, workdir, resume=resume)
         else:
-            print("  ⏭ Reusing cached final latents.")
+            print("  ⏭ Reusing cached final latents (PHASE A + diffusion skipped).")
 
         frames, decoded_audio = decode_final_latents(video_lat_path, audio_lat_path, workdir)
         total_frames = int(frames.shape[0])
