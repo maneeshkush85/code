@@ -929,12 +929,21 @@ def call_node(node_instance: Any, **kwargs) -> Any:
         for name in spec_opt:
             if name in kwargs and kwargs[name] is not None:
                 call_kwargs[name] = kwargs[name]
-        # Forward extra dynamic kwargs (rgthree loras etc.) if **kwargs accepted.
-        try:
-            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD
-                             for p in inspect.signature(primary).parameters.values())
-        except Exception:
-            has_var_kw = True
+        # Forward extra dynamic kwargs (e.g. rgthree Power-Lora entries) ONLY for
+        # genuine legacy (V1) node functions that declare **kwargs. V3-schema
+        # nodes route through the generic EXECUTE_NORMALIZED(*args, **kwargs)
+        # wrapper but their real execute() is STRICT to INPUT_TYPES — forwarding
+        # non-spec keys there raises 'unexpected keyword argument'. So we never
+        # forward extras when the primary is the normalized wrapper.
+        primary_name = getattr(primary, "__name__", "")
+        is_v3_normalized = primary_name == "EXECUTE_NORMALIZED"
+        has_var_kw = False
+        if not is_v3_normalized:
+            try:
+                has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD
+                                 for p in inspect.signature(primary).parameters.values())
+            except Exception:
+                has_var_kw = False
         if has_var_kw:
             for k, v in kwargs.items():
                 if k not in call_kwargs and v is not None:
